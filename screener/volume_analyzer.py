@@ -1,4 +1,3 @@
-import pandas as pd
 from loguru import logger
 
 
@@ -14,7 +13,7 @@ class VolumeAnalyzer:
             if df is None or df.empty:
                 return {"score": 0}
 
-            # ✅ SAFE scalar extraction
+            # ✅ FIXED (no warnings, no Series issues)
             latest_vol = float(df["Volume"].iloc[-1])
             avg_vol = float(df["Volume"].tail(20).mean())
 
@@ -23,7 +22,6 @@ class VolumeAnalyzer:
 
             ratio = latest_vol / avg_vol
 
-            # ✅ simple scoring logic
             if ratio > 2:
                 score = 20
             elif ratio > 1.5:
