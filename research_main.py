@@ -17,7 +17,10 @@ Usage:
   # Force all symbols through Gemini (skip Groq gating)
   python research_main.py --symbols BAJFINANCE --force-deep
 """
+import os
+from dotenv import load_dotenv
 
+load_dotenv()
 import sys
 import os
 import json
