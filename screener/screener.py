@@ -39,13 +39,12 @@ class IndiaStockScreener:
         self.fundamental = FundamentalAnalyzer(session, self.config)
 
     # ------------------------------------------------ #
-    # Logging
+    # LOGGING
     # ------------------------------------------------ #
 
     def _setup_logging(self):
         log_dir = self.config.get("logging", {}).get("log_dir", "logs")
         os.makedirs(log_dir, exist_ok=True)
-
         logger.add(f"{log_dir}/screener.log", rotation="1 day", retention="7 days")
 
     # ------------------------------------------------ #
@@ -67,7 +66,43 @@ class IndiaStockScreener:
         conn.close()
 
     # ------------------------------------------------ #
-    # SAFE FILTER
+    # SAFE HELPERS
+    # ------------------------------------------------ #
+
+    def _safe_float(self, x, default=0.0):
+        try:
+            if hasattr(x, "iloc"):  # pandas series
+                return float(x.iloc[-1])
+            return float(x)
+        except:
+            return default
+
+    def _safe_dict(self, d):
+        """Ensure dict + convert Series → scalar"""
+        if not isinstance(d, dict):
+            return {}
+
+        clean = {}
+        for k, v in d.items():
+            try:
+                if hasattr(v, "iloc"):
+                    clean[k] = float(v.iloc[-1])
+                else:
+                    clean[k] = v
+            except:
+                clean[k] = 0
+        return clean
+
+    def _safe_call(self, fn, *args):
+        try:
+            out = fn(*args)
+            return out if isinstance(out, dict) else {}
+        except Exception as e:
+            logger.error(f"Analyzer error: {e}")
+            return {}
+
+    # ------------------------------------------------ #
+    # FILTER
     # ------------------------------------------------ #
 
     def _passes_filters(self, df):
@@ -76,9 +111,7 @@ class IndiaStockScreener:
             return False
 
         try:
-            close = df["Close"].iloc[-1]
-            close = float(close.item() if hasattr(close, "item") else close)
-
+            close = self._safe_float(df["Close"])
             avg_vol = df["Volume"].tail(20).mean()
 
             cfg = self.config["screening"]
@@ -87,12 +120,11 @@ class IndiaStockScreener:
                 cfg["min_price"] <= close <= cfg["max_price"]
                 and avg_vol >= cfg["min_volume"]
             )
-
         except:
             return False
 
     # ------------------------------------------------ #
-    # CORE ANALYSIS
+    # CORE ANALYSIS (FULL SAFE)
     # ------------------------------------------------ #
 
     def analyze_symbol(self, symbol, fii_dii, delivery_df, mode="all"):
@@ -103,18 +135,16 @@ class IndiaStockScreener:
             if not self._passes_filters(df):
                 return None
 
-            close_val = df["Close"].iloc[-1]
-            close_val = close_val.item() if hasattr(close_val, "item") else close_val
-            ltp = float(close_val)
+            ltp = self._safe_float(df["Close"])
 
-            # --- analyzers (safe) ---
-            sm = self.smart_money.score(symbol, fii_dii) or {}
-            vol = self.volume.score(symbol, df, delivery_df) or {}
-            tech = self.tech.score(symbol, df) or {}
-            news = self.news.score(symbol) or {}
-            fund = self.fundamental.score(symbol) or {}
+            # --- ANALYZERS ---
+            sm = self._safe_dict(self._safe_call(self.smart_money.score, symbol, fii_dii))
+            vol = self._safe_dict(self._safe_call(self.volume.score, symbol, df, delivery_df))
+            tech = self._safe_dict(self._safe_call(self.tech.score, symbol, df))
+            news = self._safe_dict(self._safe_call(self.news.score, symbol))
+            fund = self._safe_dict(self._safe_call(self.fundamental.score, symbol))
 
-            # --- result ---
+            # --- BUILD RESULT ---
             result = self.scorer.build_result(
                 symbol=symbol,
                 ltp=ltp,
@@ -131,18 +161,14 @@ class IndiaStockScreener:
             score = result.get("composite_score", 0)
             setup = result.get("setup_type", "")
 
-            # --- filters ---
+            # --- FILTER ---
             if mode == "btst" and setup not in ["BTST", "INTRADAY"]:
                 return None
 
             if score < self.config["scoring"]["watch_threshold"]:
                 return None
 
-            tech_data = result.get("technical", {})
-            if not isinstance(tech_data, dict) or tech_data.get("rsi") is None:
-                return None
-
-            logger.info(f"{symbol} | Score={score} | {result.get('signal')}")
+            logger.info(f"✅ {symbol} | Score={score} | {result.get('signal')}")
 
             return result
 
@@ -154,7 +180,7 @@ class IndiaStockScreener:
     # RUN
     # ------------------------------------------------ #
 
-    def run(self, mode="all", max_workers=5):
+    def run(self, mode="all", max_workers=2):  # 🔥 reduced threads (fix DB lock)
 
         logger.info(f"Starting screener: {mode}")
         start = time.time()
@@ -164,20 +190,23 @@ class IndiaStockScreener:
         symbols = self.fetcher.get_universe()
 
         if not symbols:
-            logger.error("No symbols")
+            logger.error("No symbols fetched")
             return pd.DataFrame()
 
         results = []
 
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(self.analyze_symbol, s, fii_dii, delivery_df, mode) for s in symbols]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self.analyze_symbol, s, fii_dii, delivery_df, mode): s
+                for s in symbols
+            }
 
             for f in as_completed(futures):
                 r = f.result()
                 if r:
                     results.append(r)
 
-        logger.info(f"Done in {round(time.time()-start,2)}s")
+        logger.info(f"Done in {round(time.time() - start, 2)}s")
 
         if not results:
             logger.warning("No setups found")
@@ -197,12 +226,13 @@ class IndiaStockScreener:
         if df.empty:
             return
 
+        os.makedirs("data/results", exist_ok=True)
         df.to_csv("data/results/latest.csv", index=False)
 
-        conn = sqlite3.connect(self.db_path)
+        try:
+            conn = sqlite3.connect(self.db_path)
 
-        for r in raw:
-            try:
+            for r in raw:
                 conn.execute(
                     "INSERT INTO results VALUES (?,?,?,?)",
                     (
@@ -212,8 +242,9 @@ class IndiaStockScreener:
                         r.get("timestamp"),
                     ),
                 )
-            except:
-                pass
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            logger.warning(f"DB save failed: {e}")
