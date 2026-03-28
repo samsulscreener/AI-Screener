@@ -32,28 +32,33 @@ class TechnicalAnalyzer:
             rs = avg_gain / (avg_loss + 1e-9)
             rsi = 100 - (100 / (1 + rs))
 
-            rsi_val = float(rsi.iloc[-1])
+            rsi_val = float(rsi.iloc[-1].item())
 
             # ---------------- SCORING ---------------- #
-            score = 0
+           score = 0
 
-            # ✅ NOW SAFE (all scalars)
-            if last_close > ma20:
-                score += 10
+# ---------------- STRONG TREND ---------------- #
 
-            if last_close > ma50:
-                score += 10
+        if last_close > ma20:
+            score += 20
 
-            if 50 < rsi_val < 70:
-                score += 10
+        if last_close > ma50:
+            score += 20
 
-            elif rsi_val < 30:
-                score += 5
+# ---------------- RSI STRENGTH ---------------- #
 
-            return {
-                "score": score,
-                "rsi": round(rsi_val, 2),
-                "trend": "bullish" if last_close > ma50 else "bearish"
+        if 50 < rsi_val < 65:
+            score += 20
+
+        elif 65 <= rsi_val < 75:
+            score += 15
+
+        elif rsi_val < 30:
+            score += 10
+                return {
+                    "score": score,
+                    "rsi": round(rsi_val, 2),
+                    "trend": "bullish" if last_close > ma50 else "bearish"
             }
 
         except Exception as e:
