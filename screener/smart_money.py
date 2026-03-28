@@ -1,14 +1,3 @@
-"""
-smart_money.py
---------------
-Tracks institutional & smart money signals:
-  - FII / DII net activity (daily flows)
-  - Bulk deals & Block deals from NSE
-  - Insider trading (SAST filings via NSE)
-  - Promoter pledging changes
-  - Mutual Fund holdings changes (quarterly)
-"""
-
 import requests
 import pandas as pd
 from loguru import logger
@@ -24,197 +13,174 @@ NSE_HEADERS = {
 
 
 class SmartMoneyAnalyzer:
+
     def __init__(self, session: requests.Session, config: dict):
         self.session = session
         self.cfg = config["signals"]["smart_money"]
 
-    # ------------------------------------------------------------------ #
-    #  FII / DII Daily Activity
-    # ------------------------------------------------------------------ #
+        # 🔥 CACHE (critical)
+        self._bulk_cache = None
+        self._block_cache = None
+        self._fii_cache = None
 
-    def get_fii_dii_activity(self) -> dict:
-        """
-        Fetch today's FII/DII net buy/sell from NSE.
-        Returns aggregated net values in crores.
-        """
-        url = "https://www.nseindia.com/api/fiidiiTradeReact"
+    # ---------------- SAFE REQUEST ---------------- #
+
+    def _safe_json(self, url):
         try:
-            resp = self.session.get(url, headers=NSE_HEADERS, timeout=15)
-            data = resp.json()
-            rows = data if isinstance(data, list) else data.get("data", [])
+            r = self.session.get(url, headers=NSE_HEADERS, timeout=10)
 
-            fii_net = dii_net = 0.0
-            for row in rows[:2]:  # Latest 2 entries (Cash + Derivatives or same day)
-                category = row.get("category", "").upper()
-                net = float(str(row.get("netPurchasesSales", "0")).replace(",", ""))
-                if "FII" in category or "FPI" in category:
-                    fii_net += net
-                elif "DII" in category:
-                    dii_net += net
+            if r.status_code != 200:
+                return None
 
-            result = {
-                "fii_net_cr": round(fii_net, 2),
-                "dii_net_cr": round(dii_net, 2),
-                "fii_positive": fii_net > self.cfg["fii_net_buy_threshold_cr"],
-                "combined_net_cr": round(fii_net + dii_net, 2),
-            }
-            logger.info(f"FII/DII: FII={fii_net}Cr, DII={dii_net}Cr")
-            return result
-        except Exception as e:
-            logger.error(f"FII/DII fetch failed: {e}")
+            return r.json()
+
+        except Exception:
+            return None
+
+    # ---------------- FII/DII ---------------- #
+
+    def get_fii_dii_activity(self):
+
+        if self._fii_cache:
+            return self._fii_cache
+
+        url = "https://www.nseindia.com/api/fiidiiTradeReact"
+        data = self._safe_json(url)
+
+        if not data:
             return {"fii_net_cr": 0, "dii_net_cr": 0, "fii_positive": False}
 
-    # ------------------------------------------------------------------ #
-    #  Bulk & Block Deals
-    # ------------------------------------------------------------------ #
+        rows = data if isinstance(data, list) else data.get("data", [])
 
-    def get_bulk_deals(self, days_back: int = 3) -> pd.DataFrame:
-        """Fetch recent bulk deals from NSE."""
+        fii = dii = 0
+
+        for r in rows[:2]:
+            cat = str(r.get("category", "")).upper()
+            val = float(str(r.get("netPurchasesSales", "0")).replace(",", "") or 0)
+
+            if "FII" in cat or "FPI" in cat:
+                fii += val
+            elif "DII" in cat:
+                dii += val
+
+        res = {
+            "fii_net_cr": fii,
+            "dii_net_cr": dii,
+            "fii_positive": fii > self.cfg["fii_net_buy_threshold_cr"],
+        }
+
+        self._fii_cache = res
+        return res
+
+    # ---------------- BULK ---------------- #
+
+    def get_bulk_deals(self):
+
+        if self._bulk_cache is not None:
+            return self._bulk_cache
+
         url = "https://www.nseindia.com/api/bulk-deals"
-        try:
-            resp = self.session.get(url, headers=NSE_HEADERS, timeout=15)
-            data = resp.json()
-            rows = data.get("data", [])
-            df = pd.DataFrame(rows)
-            if df.empty:
-                return df
+        data = self._safe_json(url)
 
-            df["date"] = pd.to_datetime(df.get("date", df.get("BD_DT_DATE", "")))
-            cutoff = datetime.now(IST).date() - timedelta(days=days_back)
-            df = df[df["date"].dt.date >= cutoff]
-
-            # Normalize column names across API versions
-            col_map = {
-                "BD_SYMBOL": "symbol", "BD_SCRIP_CD": "symbol",
-                "BD_CLIENT_NAME": "client", "BD_QTY_TRD": "qty",
-                "BD_TP_WATP": "price", "BD_BUYSELL": "side",
-            }
-            df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-            logger.info(f"Bulk deals fetched: {len(df)} rows")
-            return df
-        except Exception as e:
-            logger.error(f"Bulk deals fetch failed: {e}")
+        if not data:
             return pd.DataFrame()
 
-    def get_block_deals(self) -> pd.DataFrame:
-        """Fetch block deals from NSE."""
-        url = "https://www.nseindia.com/api/block-deals"
-        try:
-            resp = self.session.get(url, headers=NSE_HEADERS, timeout=15)
-            data = resp.json()
-            df = pd.DataFrame(data.get("data", []))
-            logger.info(f"Block deals fetched: {len(df)} rows")
+        df = pd.DataFrame(data.get("data", []))
+
+        if df.empty:
             return df
-        except Exception as e:
-            logger.error(f"Block deals fetch failed: {e}")
-            return pd.DataFrame()
 
-    def get_deals_for_symbol(self, symbol: str) -> dict:
-        """Aggregate bulk/block deal activity for a specific symbol."""
-        bulk = self.get_bulk_deals()
-        block = self.get_block_deals()
-        results = {"bulk_buy": 0, "bulk_sell": 0, "block_value_cr": 0, "notable_buyers": []}
+        try:
+            df["symbol"] = df.get("symbol", df.get("BD_SYMBOL", ""))
+            df["qty"] = pd.to_numeric(df.get("qty", df.get("BD_QTY_TRD", 0)), errors="coerce")
+            df["price"] = pd.to_numeric(df.get("price", df.get("BD_TP_WATP", 0)), errors="coerce")
+            df["side"] = df.get("side", df.get("BD_BUYSELL", ""))
 
-        if not bulk.empty and "symbol" in bulk.columns:
-            sym_bulk = bulk[bulk["symbol"].str.upper() == symbol.upper()]
-            for _, row in sym_bulk.iterrows():
-                side = str(row.get("side", "")).upper()
-                qty = float(str(row.get("qty", 0)).replace(",", "") or 0)
-                price = float(str(row.get("price", 0)).replace(",", "") or 0)
-                value_cr = (qty * price) / 1e7
-                if "B" in side:
-                    results["bulk_buy"] += value_cr
-                    client = str(row.get("client", ""))
-                    if client and value_cr >= self.cfg["bulk_deal_min_value_cr"]:
-                        results["notable_buyers"].append(client)
-                else:
-                    results["bulk_sell"] += value_cr
+        except:
+            pass
 
-        results["bulk_buy"] = round(results["bulk_buy"], 2)
-        results["bulk_sell"] = round(results["bulk_sell"], 2)
-        return results
+        self._bulk_cache = df
+        return df
 
-    # ------------------------------------------------------------------ #
-    #  Insider Trading (SAST / SEBI Filings)
-    # ------------------------------------------------------------------ #
+    # ---------------- DEALS ---------------- #
 
-    def get_insider_trades(self, symbol: str) -> dict:
-        """
-        Fetch insider/promoter trading from NSE SAST filings.
-        Returns net promoter activity in shares.
-        """
+    def get_deals_for_symbol(self, symbol):
+
+        df = self.get_bulk_deals()
+
+        if df.empty or "symbol" not in df.columns:
+            return {"net": 0}
+
+        sym_df = df[df["symbol"].str.upper() == symbol.upper()]
+
+        if sym_df.empty:
+            return {"net": 0}
+
+        buy = sell = 0
+
+        for _, r in sym_df.iterrows():
+            val = (r.get("qty", 0) * r.get("price", 0)) / 1e7
+
+            if "B" in str(r.get("side", "")).upper():
+                buy += val
+            else:
+                sell += val
+
+        return {"net": buy - sell}
+
+    # ---------------- INSIDER ---------------- #
+
+    def get_insider_trades(self, symbol):
+
         url = f"https://www.nseindia.com/api/inside-trading?symbol={symbol}"
-        try:
-            resp = self.session.get(url, headers=NSE_HEADERS, timeout=15)
-            data = resp.json()
-            trades = data.get("data", [])
+        data = self._safe_json(url)
 
-            window = self.cfg.get("insider_window_days", 30)
-            cutoff = datetime.now(IST).date() - timedelta(days=window)
+        if not data:
+            return False
 
-            buy_qty = sell_qty = 0
-            for t in trades:
-                try:
-                    t_date = pd.to_datetime(t.get("date", "")).date()
-                    if t_date < cutoff:
-                        continue
-                    acq = float(str(t.get("acquisitionDisposal", "0")).replace(",", "") or 0)
-                    trans_type = t.get("tdpTransactionType", "")
-                    if "Acqu" in trans_type or "Buy" in trans_type:
-                        buy_qty += acq
-                    else:
-                        sell_qty += acq
-                except Exception:
-                    pass
+        trades = data.get("data", [])
 
-            return {
-                "insider_buy_qty": buy_qty,
-                "insider_sell_qty": sell_qty,
-                "insider_net_positive": buy_qty > sell_qty and buy_qty > 0,
-            }
-        except Exception as e:
-            logger.warning(f"Insider trades fetch failed for {symbol}: {e}")
-            return {"insider_buy_qty": 0, "insider_sell_qty": 0, "insider_net_positive": False}
+        buy = sell = 0
 
-    # ------------------------------------------------------------------ #
-    #  Composite Smart Money Score
-    # ------------------------------------------------------------------ #
+        for t in trades[:10]:  # limit for speed
+            val = float(str(t.get("acquisitionDisposal", 0)).replace(",", "") or 0)
 
-    def score(self, symbol: str, fii_dii: dict) -> dict:
-        """
-        Returns a smart money score (0-100) for a symbol.
+            if "Buy" in str(t.get("tdpTransactionType", "")):
+                buy += val
+            else:
+                sell += val
 
-        Scoring breakdown (each normalized to 0-25):
-          - FII net positive day:        8 pts
-          - DII net positive day:        4 pts
-          - Bulk deal net buy:           8 pts
-          - Insider net buy (30d):       5 pts
-        """
+        return buy > sell and buy > 0
+
+    # ---------------- SCORE ---------------- #
+
+    def score(self, symbol, fii_dii):
+
         pts = 0
         details = {}
 
-        # FII/DII global signal
+        # FII
         if fii_dii.get("fii_positive"):
             pts += 8
-            details["fii"] = f"FII net buy ₹{fii_dii['fii_net_cr']}Cr ✅"
+
+        # DII
         if fii_dii.get("dii_net_cr", 0) > 0:
             pts += 4
-            details["dii"] = f"DII net buy ₹{fii_dii['dii_net_cr']}Cr ✅"
 
-        # Bulk/block deals for this symbol
+        # Deals
         deals = self.get_deals_for_symbol(symbol)
-        net_deal = deals["bulk_buy"] - deals["bulk_sell"]
-        if net_deal > 0:
-            pts += min(8, int(net_deal / self.cfg["bulk_deal_min_value_cr"]) * 2)
-            details["bulk"] = f"Net bulk buy ₹{net_deal:.1f}Cr ✅"
-            if deals["notable_buyers"]:
-                details["buyers"] = ", ".join(deals["notable_buyers"][:3])
+        if deals["net"] > self.cfg["bulk_deal_min_value_cr"]:
+            pts += 6
+            details["bulk"] = deals["net"]
 
-        # Insider trades
-        insider = self.get_insider_trades(symbol)
-        if insider["insider_net_positive"]:
-            pts += 5
-            details["insider"] = f"Insider buying {int(insider['insider_buy_qty']):,} shares ✅"
+        # Insider
+        if self.get_insider_trades(symbol):
+            pts += 4
+            details["insider"] = "buying"
 
-        score = min(100, int(pts / 25 * 100))
-        return {"score": score, "raw_pts": pts, "details": details}
+        score = int(min(100, pts / 25 * 100))
+
+        return {
+            "score": score,
+            "details": details,
+        }
