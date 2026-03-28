@@ -151,7 +151,7 @@ class IndiaStockScreener:
             logger.info(f"{symbol} → Score: {score}")
 
             # 🔥 TEMPORARY LOW FILTER (for visibility)
-            if score < 30:
+            if score < 20:
                 return None
 
             logger.info(f"✅ {symbol} | Score={score} | {result.get('signal')}")
