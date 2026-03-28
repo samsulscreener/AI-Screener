@@ -1,6 +1,5 @@
 import pandas as pd
 from datetime import datetime
-from loguru import logger
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -23,39 +22,45 @@ class Scorer:
         self.strong_buy = config["scoring"]["strong_buy_threshold"]
         self.watch = config["scoring"]["watch_threshold"]
 
-    # ------------------------------------------------ #
-    # COMPOSITE SCORE
-    # ------------------------------------------------ #
+    # ---------------- SAFE VALUE ---------------- #
+
+    def _safe_val(self, x, default=0):
+        try:
+            if hasattr(x, "iloc"):
+                return float(x.iloc[-1])
+            return float(x)
+        except:
+            return default
+
+    # ---------------- SCORE ---------------- #
 
     def composite_score(self, sm, vol, tech, news, fund):
 
-        try:
-            score = (
-                sm * self.weights["smart_money"] +
-                vol * self.weights["volume"] +
-                tech * self.weights["technical"] +
-                news * self.weights["news"] +
-                fund * self.weights["fundamental"]
-            )
-            return int(round(score))
-        except:
-            return 0
+        return int(round(
+            self._safe_val(sm) * self.weights["smart_money"] +
+            self._safe_val(vol) * self.weights["volume"] +
+            self._safe_val(tech) * self.weights["technical"] +
+            self._safe_val(news) * self.weights["news"] +
+            self._safe_val(fund) * self.weights["fundamental"]
+        ))
 
-    # ------------------------------------------------ #
-    # CLASSIFY
-    # ------------------------------------------------ #
+    # ---------------- CLASSIFY ---------------- #
 
     def classify_setup(self, score, tech, vol):
 
-        spike = vol.get("spike_ratio", 1) or 1
-        patterns = tech.get("patterns", []) or []
-        ema = tech.get("ema_aligned", False)
-        st = tech.get("supertrend_buy", False)
+        spike = self._safe_val(vol.get("spike_ratio", 1), 1)
+
+        patterns = tech.get("patterns", [])
+        if not isinstance(patterns, list):
+            patterns = []
+
+        ema = bool(tech.get("ema_aligned", False))
+        st = bool(tech.get("supertrend_buy", False))
 
         if spike >= 2.5 and score >= 60:
             return "INTRADAY"
 
-        if patterns and score >= 55:
+        if len(patterns) > 0 and score >= 55:
             return "BTST"
 
         if ema and st and score >= 50:
@@ -66,16 +71,13 @@ class Scorer:
 
         return "NO_SIGNAL"
 
-    # ------------------------------------------------ #
-    # TRADE SETUP (SMART)
-    # ------------------------------------------------ #
+    # ---------------- TRADE ---------------- #
 
-    def generate_trade_setup(self, ltp, score, setup):
+    def generate_trade_setup(self, ltp, score):
 
         if ltp <= 0:
             return {}
 
-        # dynamic risk model
         if score >= 75:
             tp, sl = 0.05, 0.02
         elif score >= 60:
@@ -83,39 +85,25 @@ class Scorer:
         else:
             tp, sl = 0.03, 0.015
 
-        entry_low = round(ltp * 0.995, 2)
-        entry_high = round(ltp * 1.005, 2)
-
+        entry = ltp
         target = round(ltp * (1 + tp), 2)
         stop = round(ltp * (1 - sl), 2)
 
-        risk = ltp - stop
-        reward = target - ltp
+        risk = entry - stop
+        reward = target - entry
 
         rr = round(reward / risk, 1) if risk > 0 else 0
 
         return {
-            "entry_low": entry_low,
-            "entry_high": entry_high,
+            "entry_low": entry,
             "target": target,
             "stop_loss": stop,
             "rr_ratio": rr,
         }
 
-    # ------------------------------------------------ #
-    # BUILD RESULT
-    # ------------------------------------------------ #
+    # ---------------- BUILD ---------------- #
 
-    def build_result(
-        self,
-        symbol,
-        ltp,
-        sm_result,
-        vol_result,
-        tech_result,
-        news_result,
-        fund_result,
-    ):
+    def build_result(self, symbol, ltp, sm_result, vol_result, tech_result, news_result, fund_result):
 
         sm = sm_result.get("score", 0)
         vol = vol_result.get("score", 0)
@@ -127,9 +115,8 @@ class Scorer:
 
         setup = self.classify_setup(comp, tech_result, vol_result)
 
-        trade = self.generate_trade_setup(ltp, comp, setup)
+        trade = self.generate_trade_setup(ltp, comp)
 
-        # SIGNAL LOGIC (FIXED)
         if comp >= self.strong_buy:
             signal = "BUY"
         elif comp >= self.watch:
@@ -143,42 +130,25 @@ class Scorer:
             "composite_score": comp,
             "signal": signal,
             "setup_type": setup,
-            "scores": {
-                "smart_money": sm,
-                "volume": vol,
-                "technical": tech,
-                "news": news,
-                "fundamental": fund,
-            },
             "technical": tech_result or {},
             "volume": vol_result or {},
             "trade_setup": trade,
             "timestamp": datetime.now(IST).isoformat(),
         }
 
-    # ------------------------------------------------ #
-    # DATAFRAME
-    # ------------------------------------------------ #
+    # ---------------- DF ---------------- #
 
     def to_dataframe(self, results):
 
         rows = []
 
         for r in results:
-            try:
-                rows.append({
-                    "Symbol": r["symbol"],
-                    "Score": r["composite_score"],
-                    "Signal": r["signal"],
-                    "Setup": r["setup_type"],
-                    "Entry": r["trade_setup"].get("entry_low"),
-                    "Target": r["trade_setup"].get("target"),
-                    "SL": r["trade_setup"].get("stop_loss"),
-                })
-            except:
-                continue
+            rows.append({
+                "Symbol": r.get("symbol"),
+                "Score": r.get("composite_score"),
+                "Signal": r.get("signal"),
+                "Setup": r.get("setup_type"),
+                "Target": r.get("trade_setup", {}).get("target"),
+            })
 
-        if not rows:
-            return pd.DataFrame()
-
-        return pd.DataFrame(rows).sort_values("Score", ascending=False)
+        return pd.DataFrame(rows)
