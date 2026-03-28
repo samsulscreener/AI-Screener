@@ -1,242 +1,194 @@
-"""
-volume_analyzer.py
-------------------
-Detects unusual volume activity, delivery % spikes,
-and open interest buildup — key smart-money footprints.
-"""
-
 import numpy as np
 import pandas as pd
 from loguru import logger
-from typing import Optional
 import requests
 
 NSE_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com"}
 
 
 class VolumeAnalyzer:
+
     def __init__(self, session: requests.Session, config: dict):
         self.session = session
         self.cfg = config["signals"]["volume"]
 
-    # ------------------------------------------------------------------ #
-    #  Volume Spike Detection
-    # ------------------------------------------------------------------ #
+    # ---------------- Volume ---------------- #
 
-    def analyze_volume(self, symbol: str, df: pd.DataFrame) -> dict:
-        """
-        Analyze OHLCV dataframe for volume anomalies.
+    def analyze_volume(self, symbol, df):
 
-        Signals:
-          - Volume spike vs 20-day average
-          - Price+Volume expansion (institutional accumulation)
-          - Volume contraction on pullbacks (holding pattern)
-          - Accumulation/Distribution
-        """
-        if df is None or len(df) < 22:
+        if df is None or len(df) < 25:
             return {"score": 0, "details": {}}
 
-        vol = df["Volume"].values
-        close = df["Close"].values
+        try:
+            vol = df["Volume"].values
+            close = df["Close"].values
 
-        vol_20avg = vol[-21:-1].mean()
-        vol_today = vol[-1]
-        spike_ratio = vol_today / vol_20avg if vol_20avg > 0 else 1.0
-        spike_thresh = self.cfg["spike_multiplier"]
+            # SAFE slicing
+            vol_20avg = np.nanmean(vol[-21:-1])
+            vol_today = vol[-1]
 
-        # Price-Volume relationship
-        price_up = close[-1] > close[-2]
-        vol_expanding = vol_today > vol_20avg
+            if vol_20avg <= 0 or np.isnan(vol_20avg):
+                return {"score": 0, "details": {}}
 
-        # Volume trend (5-day vs 20-day)
-        vol_5avg = vol[-6:-1].mean()
-        vol_trend_up = vol_5avg > vol_20avg
+            spike_ratio = vol_today / vol_20avg
 
-        # A/D (Accumulation / Distribution) indicator
-        ad = self._calc_ad(df)
-        ad_trend = (ad[-1] - ad[-6]) > 0 if len(ad) >= 6 else False
+            price_up = close[-1] > close[-2]
 
-        # Volume on up-days vs down-days (last 10)
-        up_days_vol = df[df["Close"] > df["Open"]]["Volume"].tail(10).mean()
-        dn_days_vol = df[df["Close"] <= df["Open"]]["Volume"].tail(10).mean()
-        vol_quality = (up_days_vol / dn_days_vol) if dn_days_vol > 0 else 1.0
+            vol_5avg = np.nanmean(vol[-6:-1])
+            vol_trend_up = vol_5avg > vol_20avg
 
-        pts = 0
-        details = {}
+            # A/D
+            ad = self._calc_ad(df)
+            ad_trend = len(ad) > 5 and (ad[-1] > ad[-6])
 
-        # 1. Volume spike
-        if spike_ratio >= spike_thresh:
-            pts += 10
-            details["spike"] = f"Volume {spike_ratio:.1f}x 20-day avg 🔴"
-        elif spike_ratio >= 1.5:
-            pts += 5
-            details["spike"] = f"Volume {spike_ratio:.1f}x avg (moderate)"
+            # Up vs down volume
+            up_df = df[df["Close"] > df["Open"]]
+            dn_df = df[df["Close"] <= df["Open"]]
 
-        # 2. Price-volume confirmation
-        if price_up and vol_expanding:
-            pts += 5
-            details["pv"] = "Price up + expanding volume ✅"
-        elif not price_up and not vol_expanding:
-            pts += 3
-            details["pv"] = "Pullback on low volume (healthy)"
+            up_vol = up_df["Volume"].tail(10).mean() if not up_df.empty else 0
+            dn_vol = dn_df["Volume"].tail(10).mean() if not dn_df.empty else 1
 
-        # 3. Volume trend
-        if vol_trend_up:
-            pts += 3
-            details["trend"] = "5d > 20d volume trend ✅"
+            vol_quality = up_vol / dn_vol if dn_vol > 0 else 1
 
-        # 4. A/D indicator
-        if ad_trend:
-            pts += 4
-            details["ad"] = "Accumulation/Distribution positive ✅"
+            pts = 0
+            details = {}
 
-        # 5. Vol quality (up vs down day volume)
-        if vol_quality >= 1.5:
-            pts += 3
-            details["quality"] = f"Up-day vol/Down-day vol ratio: {vol_quality:.1f} ✅"
+            # -------- scoring -------- #
 
-        score = min(100, int(pts / 25 * 100))
-        return {
-            "score": score,
-            "raw_pts": pts,
-            "spike_ratio": round(spike_ratio, 2),
-            "vol_today": int(vol_today),
-            "vol_20avg": int(vol_20avg),
-            "details": details,
-        }
+            if spike_ratio >= self.cfg["spike_multiplier"]:
+                pts += 10
+                details["spike"] = f"{spike_ratio:.1f}x"
 
-    def _calc_ad(self, df: pd.DataFrame) -> np.ndarray:
-        """Accumulation/Distribution Line."""
+            elif spike_ratio >= 1.5:
+                pts += 5
+
+            if price_up and vol_today > vol_20avg:
+                pts += 5
+
+            if vol_trend_up:
+                pts += 3
+
+            if ad_trend:
+                pts += 4
+
+            if vol_quality >= 1.5:
+                pts += 3
+
+            score = int(min(100, pts / 25 * 100))
+
+            return {
+                "score": score,
+                "spike_ratio": round(spike_ratio, 2),
+                "details": details,
+            }
+
+        except Exception as e:
+            logger.error(f"{symbol} volume error: {e}")
+            return {"score": 0, "details": {}}
+
+    # ---------------- AD ---------------- #
+
+    def _calc_ad(self, df):
+
         high = df["High"].values
         low = df["Low"].values
         close = df["Close"].values
-        volume = df["Volume"].values
+        vol = df["Volume"].values
+
         mfm = ((close - low) - (high - close)) / (high - low + 1e-9)
-        mfv = mfm * volume
-        return np.cumsum(mfv)
+        return np.cumsum(mfm * vol)
 
-    # ------------------------------------------------------------------ #
-    #  Delivery %
-    # ------------------------------------------------------------------ #
+    # ---------------- Delivery ---------------- #
 
-    def get_delivery_pct(self, symbol: str, delivery_df: Optional[pd.DataFrame]) -> float:
-        """
-        Get delivery % for the symbol from bhavcopy/delivery data.
-        Returns value between 0-100.
-        """
-        if delivery_df is None or delivery_df.empty:
-            return self._fetch_delivery_from_nse(symbol)
+    def get_delivery_pct(self, symbol, delivery_df):
 
-        # Try to find column for symbol
-        sym_col = None
-        for col in ["SYMBOL", "Symbol", "symbol"]:
-            if col in delivery_df.columns:
-                sym_col = col
-                break
+        try:
+            if delivery_df is None or delivery_df.empty:
+                return self._fetch_delivery(symbol)
 
-        if sym_col:
-            row = delivery_df[delivery_df[sym_col].str.upper() == symbol.upper()]
-            if not row.empty:
-                for col in ["DELIV_PER", "DelivPer", "delivery_pct"]:
-                    if col in row.columns:
-                        return float(row[col].values[0])
-        return 0.0
+            sym_col = next((c for c in delivery_df.columns if c.lower() == "symbol"), None)
 
-    def _fetch_delivery_from_nse(self, symbol: str) -> float:
-        """Fallback: fetch delivery % from NSE quote API."""
+            if sym_col:
+                row = delivery_df[delivery_df[sym_col].str.upper() == symbol.upper()]
+
+                if not row.empty:
+                    val = row.iloc[0]
+                    for c in row.columns:
+                        if "deliv" in c.lower():
+                            return float(val[c])
+
+            return 0.0
+
+        except:
+            return 0.0
+
+    def _fetch_delivery(self, symbol):
+
         try:
             url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
-            resp = self.session.get(url, headers=NSE_HEADERS, timeout=10)
-            data = resp.json()
+            r = self.session.get(url, headers=NSE_HEADERS, timeout=10)
+
+            if r.status_code != 200:
+                return 0.0
+
+            data = r.json()
             return float(data.get("securityInfo", {}).get("deliveryToTradedQty", 0))
-        except Exception:
+
+        except:
             return 0.0
 
-    # ------------------------------------------------------------------ #
-    #  Options Open Interest
-    # ------------------------------------------------------------------ #
+    # ---------------- OI ---------------- #
 
-    def get_oi_data(self, symbol: str) -> dict:
-        """
-        Fetch options chain to compute:
-          - PCR (Put/Call Ratio)
-          - Max Pain
-          - OI buildup at key strikes
-        """
-        url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
+    def get_oi_data(self, symbol):
+
         try:
-            resp = self.session.get(url, headers=NSE_HEADERS, timeout=15)
-            data = resp.json()
-            records = data.get("records", {}).get("data", [])
-            if not records:
+            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
+            r = self.session.get(url, headers=NSE_HEADERS, timeout=10)
+
+            if r.status_code != 200:
                 return {}
 
-            total_call_oi = total_put_oi = 0
-            strikes = {}
-            for rec in records:
-                strike = rec.get("strikePrice", 0)
-                ce = rec.get("CE", {})
-                pe = rec.get("PE", {})
-                ce_oi = ce.get("openInterest", 0) if ce else 0
-                pe_oi = pe.get("openInterest", 0) if pe else 0
-                total_call_oi += ce_oi
-                total_put_oi += pe_oi
-                strikes[strike] = {"ce_oi": ce_oi, "pe_oi": pe_oi}
+            data = r.json()
+            recs = data.get("records", {}).get("data", [])
 
-            pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else 1.0
+            call_oi = sum((r.get("CE") or {}).get("openInterest", 0) for r in recs)
+            put_oi = sum((r.get("PE") or {}).get("openInterest", 0) for r in recs)
 
-            # Max pain — strike with max total expired OTM OI loss
-            max_pain = self._calc_max_pain(strikes)
+            pcr = put_oi / call_oi if call_oi > 0 else 1
 
             return {
-                "pcr": pcr,
-                "max_pain": max_pain,
-                "total_call_oi": total_call_oi,
-                "total_put_oi": total_put_oi,
-                "pcr_bullish": 0.7 <= pcr <= 1.3,   # Balanced → potential upside
+                "pcr": round(pcr, 2),
+                "bullish": 0.7 <= pcr <= 1.3,
             }
-        except Exception as e:
-            logger.warning(f"OI fetch failed for {symbol}: {e}")
+
+        except:
             return {}
 
-    def _calc_max_pain(self, strikes: dict) -> float:
-        """Calculate max pain strike price."""
-        if not strikes:
-            return 0.0
-        min_loss = float("inf")
-        max_pain_strike = 0
-        for s in strikes:
-            total_pain = sum(
-                max(0, s2 - s) * v["ce_oi"] + max(0, s - s2) * v["pe_oi"]
-                for s2, v in strikes.items()
-            )
-            if total_pain < min_loss:
-                min_loss = total_pain
-                max_pain_strike = s
-        return max_pain_strike
+    # ---------------- FINAL ---------------- #
 
-    # ------------------------------------------------------------------ #
-    #  Composite Score
-    # ------------------------------------------------------------------ #
+    def score(self, symbol, df, delivery_df=None):
 
-    def score(self, symbol: str, df: pd.DataFrame, delivery_df: Optional[pd.DataFrame] = None) -> dict:
-        """Combined volume + delivery + OI score (0-100)."""
-        vol_result = self.analyze_volume(symbol, df)
-        score = vol_result["score"]
-        details = vol_result["details"]
+        vol = self.analyze_volume(symbol, df)
 
-        # Delivery %
-        del_pct = self.get_delivery_pct(symbol, delivery_df)
-        del_thresh = self.cfg["delivery_pct_min"]
-        if del_pct >= del_thresh:
-            score = min(100, score + 15)
-            details["delivery"] = f"Delivery {del_pct:.1f}% (>{del_thresh}%) ✅"
+        score = vol["score"]
+        details = vol["details"]
 
-        # OI (optional for index stocks)
+        # delivery
+        d = self.get_delivery_pct(symbol, delivery_df)
+
+        if d >= self.cfg["delivery_pct_min"]:
+            score = min(100, score + 10)
+            details["delivery"] = d
+
+        # OI
         oi = self.get_oi_data(symbol)
-        if oi:
-            if oi.get("pcr_bullish"):
-                score = min(100, score + 5)
-                details["pcr"] = f"PCR {oi['pcr']} (balanced) ✅"
 
-        return {"score": score, "delivery_pct": del_pct, "oi": oi, "details": details}
+        if oi.get("bullish"):
+            score = min(100, score + 5)
+
+        return {
+            "score": score,
+            "delivery_pct": d,
+            "oi": oi,
+            "details": details,
+        }
