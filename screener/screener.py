@@ -113,21 +113,17 @@ class IndiaStockScreener:
 
     def _passes_filters(self, df):
 
-        if df is None or df.empty or len(df) < 50:
-            return False
+    if df is None or df.empty or len(df) < 30:
+        return False
 
-        try:
-            close = self._safe_float(df["Close"])
-            avg_vol = df["Volume"].tail(20).mean()
+    try:
+        close = self._safe_float(df["Close"])
 
-            cfg = self.config["screening"]
+        # 🔥 Relaxed filtering (critical)
+        return close > 10   # only basic sanity
 
-            return (
-                cfg["min_price"] <= close <= cfg["max_price"]
-                and avg_vol >= cfg["min_volume"]
-            )
-        except:
-            return False
+    except:
+        return False
 
     # ---------------- ANALYZE ---------------- #
 
