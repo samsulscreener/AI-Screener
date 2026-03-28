@@ -46,7 +46,9 @@ class GroqAnalyzer:
     # MODEL = "gemma2-9b-it"              # Good for structured output
 
     def __init__(self, config: dict = None):
-        self.api_key = os.getenv("GROQ_API_KEY", "")
+        import os
+
+        self.api_key = os.environ.get("GROQ_API_KEY") or ""
         self.client  = None
         self.config  = config or {}
         self._init_client()
