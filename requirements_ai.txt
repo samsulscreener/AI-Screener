@@ -1,0 +1,23 @@
+# AI Research Layer — additional requirements
+# Install on top of the base requirements.txt:
+#   pip install -r requirements.txt
+#   pip install -r requirements_ai.txt
+
+# ── Layer 1: Groq ─────────────────────────────────────────
+groq>=0.9.0
+
+# ── Layer 2: Google Gemini ────────────────────────────────
+google-generativeai>=0.8.0
+
+# ── MarketAux (via requests, already in base) ─────────────
+# No extra package needed — uses requests
+
+# ── Additional NLP / parsing ──────────────────────────────
+feedparser>=6.0.10       # RSS fallback (already in base)
+vaderSentiment>=3.3.2    # Fallback sentiment (already in base)
+
+# ── Rich terminal output ──────────────────────────────────
+rich>=13.6.0             # Already in base
+
+# ── Async (for Telegram) ─────────────────────────────────
+python-telegram-bot>=20.6  # Already in base
