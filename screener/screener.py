@@ -134,7 +134,8 @@ class IndiaStockScreener:
 
             if not self._passes_filters(df):
                 return None
-
+            
+            logger.info(f"{symbol} passed filters, analyzing...")
             ltp = self._safe_float(df["Close"].values)
 
             # analyzers
