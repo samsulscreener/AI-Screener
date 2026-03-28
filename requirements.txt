@@ -27,7 +27,6 @@ vaderSentiment>=3.3.2
 
 # Alerts
 python-telegram-bot>=20.6
-smtplib2>=0.2.1
 
 # Dashboard
 streamlit>=1.28.0
