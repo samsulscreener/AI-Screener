@@ -34,8 +34,7 @@ class TechnicalAnalyzer:
 
             rsi_val = float(rsi.iloc[-1].item())
 
-            # ---------------- SCORING ---------------- #
-           score = 0
+            score = 0
 
 # ---------------- STRONG TREND ---------------- #
 
