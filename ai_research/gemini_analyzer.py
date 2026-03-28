@@ -60,7 +60,7 @@ class GeminiAnalyzer:
     }
 
     def __init__(self, config: dict = None):
-        self.api_key = os.getenv("GOOGLE_API_KEY", "")
+        self.api_key = os.getenviron("GOOGLE_API_KEY", "")
         self.model   = None
         self.config  = config or {}
         self._init_client()
