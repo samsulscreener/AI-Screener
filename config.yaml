@@ -1,0 +1,104 @@
+# ============================================================
+#  India Smart Stock Screener — Configuration
+# ============================================================
+
+screening:
+  mode: all                     # intraday | btst | swing | all
+  universe: nifty500            # nifty50 | nifty200 | nifty500 | custom
+  custom_symbols: []            # Used only when universe: custom
+  min_price: 20
+  max_price: 15000
+  min_volume: 300000            # Minimum daily traded volume (shares)
+  min_market_cap_cr: 200        # Minimum market cap in crores
+  exclude_sectors: []           # e.g. ["PSU Bank", "Textile"]
+
+signals:
+  weights:
+    smart_money: 0.25
+    volume:      0.20
+    technical:   0.25
+    news:        0.15
+    fundamental: 0.15
+
+  volume:
+    spike_multiplier: 2.5       # Volume > 2.5x 20-day avg = spike
+    delivery_pct_min: 55        # Min delivery % to score
+    oi_buildup_pct: 15          # % OI increase to flag
+
+  technical:
+    rsi_period: 14
+    rsi_buy_zone: [35, 60]      # RSI in this range = bullish
+    rsi_oversold: 30
+    rsi_overbought: 75
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    supertrend_period: 10
+    supertrend_multiplier: 3.0
+    ema_periods: [9, 21, 50, 200]
+    bb_period: 20
+    bb_std: 2
+
+  smart_money:
+    fii_net_buy_threshold_cr: 100    # FII net buy > 100 Cr = positive
+    bulk_deal_min_value_cr: 10       # Min bulk deal value in crores
+    insider_window_days: 30          # Scan insider trades in last N days
+
+  news:
+    lookback_hours: 24
+    positive_threshold: 0.25
+    negative_threshold: -0.25
+    sources:
+      - reuters
+      - bloomberg
+      - economic_times
+      - moneycontrol
+      - business_standard
+      - livemint
+
+  fundamental:
+    min_roe: 12                  # Min ROE %
+    max_pe: 60
+    max_debt_equity: 2.0
+    earnings_surprise_pct: 5     # EPS beat by >5% = positive
+
+scoring:
+  strong_buy_threshold: 70
+  watch_threshold: 55
+
+alerts:
+  telegram:
+    enabled: true
+    min_score: 70
+    include_chart: true
+  email:
+    enabled: false
+    min_score: 75
+    recipients: []
+
+output:
+  save_to_csv: true
+  save_to_db: true
+  csv_dir: data/results
+  db_path: data/screener.db
+
+schedule:
+  timezone: Asia/Kolkata
+  intraday:
+    enabled: true
+    times: ["09:20", "10:00", "11:00", "12:30", "13:30", "14:30", "15:00"]
+    days: [Mon, Tue, Wed, Thu, Fri]
+  btst:
+    enabled: true
+    time: "15:10"
+    days: [Mon, Tue, Wed, Thu, Fri]
+  swing:
+    enabled: true
+    time: "16:00"
+    days: [Fri]
+
+logging:
+  level: INFO                   # DEBUG | INFO | WARNING | ERROR
+  log_dir: logs
+  rotate: "1 day"
+  retention: "30 days"
