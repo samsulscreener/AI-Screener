@@ -68,10 +68,7 @@ class IndiaStockScreener:
             if isinstance(x, pd.Series):
                 if x.empty:
                     return default
-                val = x.iloc[-1]
-                if isinstance(val, pd.Series):
-                    val = val.values[-1]
-                return float(val)
+                return float(x.iloc[-1])
 
             if hasattr(x, "__len__") and not isinstance(x, (str, bytes)):
                 return float(x[-1])
@@ -109,22 +106,6 @@ class IndiaStockScreener:
 
         return clean
 
-    # ---------------- FILTER ---------------- #
-
-    def _passes_filters(self, df):
-
-        if df is None or df.empty or len(df) < 30:
-            return False
-
-        try:
-            close = self._safe_float(df["Close"])
-
-            # 🔥 relaxed filter
-            return close > 10
-
-        except:
-            return False
-
     # ---------------- ANALYZE ---------------- #
 
     def analyze_symbol(self, symbol, fii_dii, delivery_df, mode="all"):
@@ -132,13 +113,20 @@ class IndiaStockScreener:
         try:
             df = self.fetcher.get_ohlcv(symbol, period="6mo")
 
-            if not self._passes_filters(df):
+            # 🔥 FULL VISIBILITY
+            if df is None or df.empty:
+                logger.warning(f"{symbol} → No data fetched")
                 return None
 
-            logger.info(f"{symbol} passed filters, analyzing...")
+            if len(df) < 30:
+                logger.warning(f"{symbol} → Not enough data ({len(df)})")
+                return None
+
+            logger.info(f"{symbol} → Data OK ({len(df)} rows)")
 
             ltp = self._safe_float(df["Close"].values)
 
+            # analyzers
             sm = self._clean_dict(self._safe_call(self.smart_money.score, symbol, fii_dii))
             vol = self._clean_dict(self._safe_call(self.volume.score, symbol, df, delivery_df))
             tech = self._clean_dict(self._safe_call(self.tech.score, symbol, df))
@@ -159,14 +147,11 @@ class IndiaStockScreener:
                 return None
 
             score = result.get("composite_score", 0)
-            setup = result.get("setup_type", "")
 
-            logger.info(f"{symbol} raw score: {score}")
+            logger.info(f"{symbol} → Score: {score}")
 
-            if mode == "btst" and setup not in ["BTST", "INTRADAY"]:
-                return None
-
-            if score < 40:
+            # 🔥 TEMPORARY LOW FILTER (for visibility)
+            if score < 30:
                 return None
 
             logger.info(f"✅ {symbol} | Score={score} | {result.get('signal')}")
@@ -189,8 +174,10 @@ class IndiaStockScreener:
 
         symbols = self.fetcher.get_universe()
 
+        # 🔥 CLEAN fallback (removed problematic symbols)
         if not symbols:
-            logger.warning("Universe fetch failed, using fallback list")
+            logger.warning("Using fallback symbols")
+
             symbols = [
                 "RELIANCE", "TCS", "INFY", "HDFCBANK",
                 "ICICIBANK", "SBIN", "AXISBANK",
