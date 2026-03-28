@@ -11,12 +11,13 @@ class Scorer:
 
         w = config["signals"]["weights"]
 
+        # 🔥 Slightly improved weights for better signals
         self.weights = {
-            "smart_money": w.get("smart_money", 0.25),
+            "smart_money": w.get("smart_money", 0.20),
             "volume": w.get("volume", 0.20),
-            "technical": w.get("technical", 0.25),
-            "news": w.get("news", 0.15),
-            "fundamental": w.get("fundamental", 0.15),
+            "technical": w.get("technical", 0.40),  # 🔥 boosted
+            "news": w.get("news", 0.10),
+            "fundamental": w.get("fundamental", 0.10),
         }
 
         self.strong_buy = config["scoring"]["strong_buy_threshold"]
@@ -24,11 +25,22 @@ class Scorer:
 
     # ---------------- SAFE VALUE ---------------- #
 
-    def _safe_val(self, x, default=0):
+    def _safe_val(self, x, default=0.0):
         try:
+            # pandas Series
             if hasattr(x, "iloc"):
                 return float(x.iloc[-1])
+
+            # None or empty
+            if x is None:
+                return default
+
+            # string numbers → convert safely
+            if isinstance(x, str):
+                return float(x)
+
             return float(x)
+
         except:
             return default
 
@@ -36,19 +48,27 @@ class Scorer:
 
     def composite_score(self, sm, vol, tech, news, fund):
 
-        return int(round(
-            self._safe_val(sm) * self.weights["smart_money"] +
-            self._safe_val(vol) * self.weights["volume"] +
-            self._safe_val(tech) * self.weights["technical"] +
-            self._safe_val(news) * self.weights["news"] +
-            self._safe_val(fund) * self.weights["fundamental"]
-        ))
+        sm = self._safe_val(sm)
+        vol = self._safe_val(vol)
+        tech = self._safe_val(tech)
+        news = self._safe_val(news)
+        fund = self._safe_val(fund)
+
+        score = (
+            sm * self.weights["smart_money"] +
+            vol * self.weights["volume"] +
+            tech * self.weights["technical"] +
+            news * self.weights["news"] +
+            fund * self.weights["fundamental"]
+        )
+
+        return int(round(score))
 
     # ---------------- CLASSIFY ---------------- #
 
     def classify_setup(self, score, tech, vol):
 
-        spike = self._safe_val(vol.get("spike_ratio", 1), 1)
+        spike = self._safe_val(vol.get("volume_ratio", 1), 1)
 
         patterns = tech.get("patterns", [])
         if not isinstance(patterns, list):
@@ -57,13 +77,13 @@ class Scorer:
         ema = bool(tech.get("ema_aligned", False))
         st = bool(tech.get("supertrend_buy", False))
 
-        if spike >= 2.5 and score >= 60:
+        if spike >= 2.5 and score >= 50:
             return "INTRADAY"
 
-        if len(patterns) > 0 and score >= 55:
+        if len(patterns) > 0 and score >= 45:
             return "BTST"
 
-        if ema and st and score >= 50:
+        if ema and st and score >= 40:
             return "SWING"
 
         if score >= self.watch:
@@ -78,14 +98,15 @@ class Scorer:
         if ltp <= 0:
             return {}
 
-        if score >= 75:
+        # 🔥 dynamic targets
+        if score >= 70:
             tp, sl = 0.05, 0.02
-        elif score >= 60:
+        elif score >= 50:
             tp, sl = 0.04, 0.02
         else:
             tp, sl = 0.03, 0.015
 
-        entry = ltp
+        entry = round(ltp, 2)
         target = round(ltp * (1 + tp), 2)
         stop = round(ltp * (1 - sl), 2)
 
@@ -105,11 +126,12 @@ class Scorer:
 
     def build_result(self, symbol, ltp, sm_result, vol_result, tech_result, news_result, fund_result):
 
-        sm = sm_result.get("score", 0)
-        vol = vol_result.get("score", 0)
-        tech = tech_result.get("score", 0)
-        news = news_result.get("score", 0)
-        fund = fund_result.get("score", 0)
+        # 🔥 FORCE NUMERIC (critical fix)
+        sm = self._safe_val(sm_result.get("score", 0))
+        vol = self._safe_val(vol_result.get("score", 0))
+        tech = self._safe_val(tech_result.get("score", 0))
+        news = self._safe_val(news_result.get("score", 0))
+        fund = self._safe_val(fund_result.get("score", 0))
 
         comp = self.composite_score(sm, vol, tech, news, fund)
 
@@ -117,10 +139,13 @@ class Scorer:
 
         trade = self.generate_trade_setup(ltp, comp)
 
+        # 🔥 relaxed signals (important)
         if comp >= self.strong_buy:
             signal = "BUY"
         elif comp >= self.watch:
             signal = "WATCH"
+        elif comp >= 20:
+            signal = "WEAK"
         else:
             signal = "IGNORE"
 
@@ -130,6 +155,13 @@ class Scorer:
             "composite_score": comp,
             "signal": signal,
             "setup_type": setup,
+            "scores": {
+                "smart_money": sm,
+                "volume": vol,
+                "technical": tech,
+                "news": news,
+                "fundamental": fund,
+            },
             "technical": tech_result or {},
             "volume": vol_result or {},
             "trade_setup": trade,
@@ -143,12 +175,20 @@ class Scorer:
         rows = []
 
         for r in results:
-            rows.append({
-                "Symbol": r.get("symbol"),
-                "Score": r.get("composite_score"),
-                "Signal": r.get("signal"),
-                "Setup": r.get("setup_type"),
-                "Target": r.get("trade_setup", {}).get("target"),
-            })
+            try:
+                rows.append({
+                    "Symbol": r.get("symbol"),
+                    "Score": r.get("composite_score"),
+                    "Signal": r.get("signal"),
+                    "Setup": r.get("setup_type"),
+                    "Entry": r.get("trade_setup", {}).get("entry_low"),
+                    "Target": r.get("trade_setup", {}).get("target"),
+                    "SL": r.get("trade_setup", {}).get("stop_loss"),
+                })
+            except:
+                continue
 
-        return pd.DataFrame(rows)
+        if not rows:
+            return pd.DataFrame()
+
+        return pd.DataFrame(rows).sort_values("Score", ascending=False)
