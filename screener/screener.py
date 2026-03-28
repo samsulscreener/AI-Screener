@@ -124,7 +124,8 @@ class IndiaStockScreener:
                 clean[k] = 0
 
         return clean
-
+    
+    logger.info(f"{symbol} raw score: {score}")
     # ------------------------------------------------ #
     # FILTER
     # ------------------------------------------------ #
@@ -190,7 +191,7 @@ class IndiaStockScreener:
             if mode == "btst" and setup not in ["BTST", "INTRADAY"]:
                 return None
 
-            if score < self.config["scoring"]["watch_threshold"]:
+            if score < 40:
                 return None
 
             logger.info(f"✅ {symbol} | Score={score} | {result.get('signal')}")
@@ -216,7 +217,14 @@ class IndiaStockScreener:
 
         if not symbols:
             logger.warning("Universe fetch failed, using fallback list")
-            symbols = ["RELIANCE", "TCS", "INFY", "HDFCBANK"]
+
+            symbols = [
+                "RELIANCE", "TCS", "INFY", "HDFCBANK",
+                "ICICIBANK", "SBIN", "AXISBANK",
+                "ITC", "LT", "BHARTIARTL",
+                "KOTAKBANK", "HCLTECH", "WIPRO",
+                "ASIANPAINT", "MARUTI"
+            ]
 
         results = []
 
