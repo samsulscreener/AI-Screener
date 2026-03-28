@@ -225,7 +225,7 @@ class IndiaStockScreener:
                 "KOTAKBANK", "HCLTECH", "WIPRO",
                 "ASIANPAINT", "MARUTI"
             ]
-
+        logger.info(f"Running for {len(symbols)} symbols")
         results = []
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
