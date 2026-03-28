@@ -38,18 +38,14 @@ class IndiaStockScreener:
         self.volume = VolumeAnalyzer(session, self.config)
         self.fundamental = FundamentalAnalyzer(session, self.config)
 
-    # ------------------------------------------------ #
-    # LOGGING
-    # ------------------------------------------------ #
+    # ---------------- LOGGING ---------------- #
 
     def _setup_logging(self):
         log_dir = self.config.get("logging", {}).get("log_dir", "logs")
         os.makedirs(log_dir, exist_ok=True)
         logger.add(f"{log_dir}/screener.log", rotation="1 day", retention="7 days")
 
-    # ------------------------------------------------ #
-    # DB
-    # ------------------------------------------------ #
+    # ---------------- DB ---------------- #
 
     def _init_db(self):
         path = self.config.get("output", {}).get("db_path", "data/screener.db")
@@ -65,36 +61,27 @@ class IndiaStockScreener:
         conn.commit()
         conn.close()
 
-    # ------------------------------------------------ #
-    # 🔥 CORE FIX: SAFE FLOAT
-    # ------------------------------------------------ #
+    # ---------------- SAFE FLOAT ---------------- #
 
     def _safe_float(self, x, default=0.0):
         try:
-            # pandas Series
             if isinstance(x, pd.Series):
                 if x.empty:
                     return default
                 val = x.iloc[-1]
-
-                # nested series edge case
                 if isinstance(val, pd.Series):
                     val = val.values[-1]
-
                 return float(val)
 
-            # numpy / list
             if hasattr(x, "__len__") and not isinstance(x, (str, bytes)):
                 return float(x[-1])
 
             return float(x)
 
-        except Exception:
+        except:
             return default
 
-    # ------------------------------------------------ #
-    # SAFE CALL
-    # ------------------------------------------------ #
+    # ---------------- SAFE CALL ---------------- #
 
     def _safe_call(self, fn, *args):
         try:
@@ -104,13 +91,10 @@ class IndiaStockScreener:
             logger.error(f"Analyzer error: {e}")
             return {}
 
-    # ------------------------------------------------ #
-    # CLEAN DICT (NO SERIES)
-    # ------------------------------------------------ #
+    # ---------------- CLEAN DICT ---------------- #
 
     def _clean_dict(self, d):
         clean = {}
-
         if not isinstance(d, dict):
             return clean
 
@@ -124,11 +108,8 @@ class IndiaStockScreener:
                 clean[k] = 0
 
         return clean
-    
-    logger.info(f"{symbol} raw score: {score}")
-    # ------------------------------------------------ #
-    # FILTER
-    # ------------------------------------------------ #
+
+    # ---------------- FILTER ---------------- #
 
     def _passes_filters(self, df):
 
@@ -148,9 +129,7 @@ class IndiaStockScreener:
         except:
             return False
 
-    # ------------------------------------------------ #
-    # CORE ANALYSIS
-    # ------------------------------------------------ #
+    # ---------------- ANALYZE ---------------- #
 
     def analyze_symbol(self, symbol, fii_dii, delivery_df, mode="all"):
 
@@ -160,17 +139,15 @@ class IndiaStockScreener:
             if not self._passes_filters(df):
                 return None
 
-            # 🔥 FIX: force scalar
             ltp = self._safe_float(df["Close"].values)
 
-            # --- analyzers ---
+            # analyzers
             sm = self._clean_dict(self._safe_call(self.smart_money.score, symbol, fii_dii))
             vol = self._clean_dict(self._safe_call(self.volume.score, symbol, df, delivery_df))
             tech = self._clean_dict(self._safe_call(self.tech.score, symbol, df))
             news = self._clean_dict(self._safe_call(self.news.score, symbol))
             fund = self._clean_dict(self._safe_call(self.fundamental.score, symbol))
 
-            # --- result ---
             result = self.scorer.build_result(
                 symbol=symbol,
                 ltp=ltp,
@@ -187,10 +164,13 @@ class IndiaStockScreener:
             score = result.get("composite_score", 0)
             setup = result.get("setup_type", "")
 
-            # --- filters ---
+            # ✅ DEBUG LOG (correct placement)
+            logger.info(f"{symbol} raw score: {score}")
+
             if mode == "btst" and setup not in ["BTST", "INTRADAY"]:
                 return None
 
+            # 🔥 relaxed filter
             if score < 40:
                 return None
 
@@ -202,9 +182,7 @@ class IndiaStockScreener:
             logger.error(f"{symbol} failed: {e}")
             return None
 
-    # ------------------------------------------------ #
-    # RUN
-    # ------------------------------------------------ #
+    # ---------------- RUN ---------------- #
 
     def run(self, mode="all", max_workers=2):
 
@@ -213,11 +191,11 @@ class IndiaStockScreener:
 
         fii_dii = self.smart_money.get_fii_dii_activity()
         delivery_df = self.fetcher.get_delivery_data()
+
         symbols = self.fetcher.get_universe()
 
         if not symbols:
             logger.warning("Universe fetch failed, using fallback list")
-
             symbols = [
                 "RELIANCE", "TCS", "INFY", "HDFCBANK",
                 "ICICIBANK", "SBIN", "AXISBANK",
@@ -225,7 +203,9 @@ class IndiaStockScreener:
                 "KOTAKBANK", "HCLTECH", "WIPRO",
                 "ASIANPAINT", "MARUTI"
             ]
+
         logger.info(f"Running for {len(symbols)} symbols")
+
         results = []
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -250,9 +230,7 @@ class IndiaStockScreener:
 
         return df
 
-    # ------------------------------------------------ #
-    # SAVE
-    # ------------------------------------------------ #
+    # ---------------- SAVE ---------------- #
 
     def _save(self, df, raw):
 
