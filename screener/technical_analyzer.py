@@ -15,7 +15,7 @@ class TechnicalAnalyzer:
 
             close_series = df["Close"]
 
-            # ✅ FORCE SCALAR VALUES
+            # ✅ SAFE SCALAR VALUES
             last_close = float(close_series.iloc[-1])
             ma20 = float(close_series.rolling(20).mean().iloc[-1])
             ma50 = float(close_series.rolling(50).mean().iloc[-1])
@@ -34,30 +34,30 @@ class TechnicalAnalyzer:
 
             rsi_val = float(rsi.iloc[-1].item())
 
+            # ---------------- SCORING ---------------- #
             score = 0
 
-# ---------------- STRONG TREND ---------------- #
+            # 🔥 STRONG TREND
+            if last_close > ma20:
+                score += 20
 
-        if last_close > ma20:
-            score += 20
+            if last_close > ma50:
+                score += 20
 
-        if last_close > ma50:
-            score += 20
+            # 🔥 RSI STRENGTH
+            if 50 < rsi_val < 65:
+                score += 20
 
-# ---------------- RSI STRENGTH ---------------- #
+            elif 65 <= rsi_val < 75:
+                score += 15
 
-        if 50 < rsi_val < 65:
-            score += 20
+            elif rsi_val < 30:
+                score += 10
 
-        elif 65 <= rsi_val < 75:
-            score += 15
-
-        elif rsi_val < 30:
-            score += 10
-                return {
-                    "score": score,
-                    "rsi": round(rsi_val, 2),
-                    "trend": "bullish" if last_close > ma50 else "bearish"
+            return {
+                "score": score,
+                "rsi": round(rsi_val, 2),
+                "trend": "bullish" if last_close > ma50 else "bearish"
             }
 
         except Exception as e:
