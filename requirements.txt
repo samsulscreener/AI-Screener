@@ -13,7 +13,6 @@ jugaad-trader>=0.20
 
 # Technical Analysis
 ta>=0.10.2
-pandas-ta
 scipy>=1.11.0
 
 # NLP / News Sentiment
