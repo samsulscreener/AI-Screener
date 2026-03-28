@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 from loguru import logger
 
 
@@ -14,15 +13,16 @@ class TechnicalAnalyzer:
             if df is None or df.empty or len(df) < 50:
                 return {"score": 0}
 
-            close = df["Close"]
+            close_series = df["Close"]
 
-            # ✅ Moving averages
-            ma20 = close.rolling(20).mean().iloc[-1]
-            ma50 = close.rolling(50).mean().iloc[-1]
-            last_close = close.iloc[-1]
+            # ✅ FORCE SCALAR VALUES
+            last_close = float(close_series.iloc[-1])
+            ma20 = float(close_series.rolling(20).mean().iloc[-1])
+            ma50 = float(close_series.rolling(50).mean().iloc[-1])
 
-            # ✅ RSI calculation
-            delta = close.diff()
+            # ---------------- RSI ---------------- #
+            delta = close_series.diff()
+
             gain = delta.clip(lower=0)
             loss = -delta.clip(upper=0)
 
@@ -31,19 +31,22 @@ class TechnicalAnalyzer:
 
             rs = avg_gain / (avg_loss + 1e-9)
             rsi = 100 - (100 / (1 + rs))
+
             rsi_val = float(rsi.iloc[-1])
 
+            # ---------------- SCORING ---------------- #
             score = 0
 
-            # ✅ Trend
+            # ✅ NOW SAFE (all scalars)
             if last_close > ma20:
                 score += 10
+
             if last_close > ma50:
                 score += 10
 
-            # ✅ RSI logic
             if 50 < rsi_val < 70:
                 score += 10
+
             elif rsi_val < 30:
                 score += 5
 
