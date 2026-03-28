@@ -113,11 +113,11 @@ class IndiaStockScreener:
 
     def _passes_filters(self, df):
 
-    if df is None or df.empty or len(df) < 30:
-        return False
+        if df is None or df.empty or len(df) < 30:
+            return False
 
-    try:
-        close = self._safe_float(df["Close"])
+        try:
+            close = self._safe_float(df["Close"])
 
         # 🔥 Relaxed filtering (critical)
         return close > 10   # only basic sanity
