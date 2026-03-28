@@ -119,11 +119,11 @@ class IndiaStockScreener:
         try:
             close = self._safe_float(df["Close"])
 
-        # 🔥 Relaxed filtering (critical)
-        return close > 10   # only basic sanity
+            # 🔥 relaxed filter
+            return close > 10
 
-    except:
-        return False
+        except:
+            return False
 
     # ---------------- ANALYZE ---------------- #
 
@@ -134,11 +134,11 @@ class IndiaStockScreener:
 
             if not self._passes_filters(df):
                 return None
-            
+
             logger.info(f"{symbol} passed filters, analyzing...")
+
             ltp = self._safe_float(df["Close"].values)
 
-            # analyzers
             sm = self._clean_dict(self._safe_call(self.smart_money.score, symbol, fii_dii))
             vol = self._clean_dict(self._safe_call(self.volume.score, symbol, df, delivery_df))
             tech = self._clean_dict(self._safe_call(self.tech.score, symbol, df))
@@ -161,13 +161,11 @@ class IndiaStockScreener:
             score = result.get("composite_score", 0)
             setup = result.get("setup_type", "")
 
-            # ✅ DEBUG LOG (correct placement)
             logger.info(f"{symbol} raw score: {score}")
 
             if mode == "btst" and setup not in ["BTST", "INTRADAY"]:
                 return None
 
-            # 🔥 relaxed filter
             if score < 40:
                 return None
 
