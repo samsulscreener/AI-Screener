@@ -66,32 +66,35 @@ class IndiaStockScreener:
         conn.close()
 
     # ------------------------------------------------ #
-    # SAFE HELPERS
+    # 🔥 CORE FIX: SAFE FLOAT
     # ------------------------------------------------ #
 
     def _safe_float(self, x, default=0.0):
         try:
-            if hasattr(x, "iloc"):  # pandas series
-                return float(x.iloc[-1])
+            # pandas Series
+            if isinstance(x, pd.Series):
+                if x.empty:
+                    return default
+                val = x.iloc[-1]
+
+                # nested series edge case
+                if isinstance(val, pd.Series):
+                    val = val.values[-1]
+
+                return float(val)
+
+            # numpy / list
+            if hasattr(x, "__len__") and not isinstance(x, (str, bytes)):
+                return float(x[-1])
+
             return float(x)
-        except:
+
+        except Exception:
             return default
 
-    def _safe_dict(self, d):
-        """Ensure dict + convert Series → scalar"""
-        if not isinstance(d, dict):
-            return {}
-
-        clean = {}
-        for k, v in d.items():
-            try:
-                if hasattr(v, "iloc"):
-                    clean[k] = float(v.iloc[-1])
-                else:
-                    clean[k] = v
-            except:
-                clean[k] = 0
-        return clean
+    # ------------------------------------------------ #
+    # SAFE CALL
+    # ------------------------------------------------ #
 
     def _safe_call(self, fn, *args):
         try:
@@ -100,6 +103,27 @@ class IndiaStockScreener:
         except Exception as e:
             logger.error(f"Analyzer error: {e}")
             return {}
+
+    # ------------------------------------------------ #
+    # CLEAN DICT (NO SERIES)
+    # ------------------------------------------------ #
+
+    def _clean_dict(self, d):
+        clean = {}
+
+        if not isinstance(d, dict):
+            return clean
+
+        for k, v in d.items():
+            try:
+                if isinstance(v, pd.Series):
+                    clean[k] = self._safe_float(v)
+                else:
+                    clean[k] = v
+            except:
+                clean[k] = 0
+
+        return clean
 
     # ------------------------------------------------ #
     # FILTER
@@ -124,7 +148,7 @@ class IndiaStockScreener:
             return False
 
     # ------------------------------------------------ #
-    # CORE ANALYSIS (FULL SAFE)
+    # CORE ANALYSIS
     # ------------------------------------------------ #
 
     def analyze_symbol(self, symbol, fii_dii, delivery_df, mode="all"):
@@ -135,16 +159,17 @@ class IndiaStockScreener:
             if not self._passes_filters(df):
                 return None
 
-            ltp = self._safe_float(df["Close"])
+            # 🔥 FIX: force scalar
+            ltp = self._safe_float(df["Close"].values)
 
-            # --- ANALYZERS ---
-            sm = self._safe_dict(self._safe_call(self.smart_money.score, symbol, fii_dii))
-            vol = self._safe_dict(self._safe_call(self.volume.score, symbol, df, delivery_df))
-            tech = self._safe_dict(self._safe_call(self.tech.score, symbol, df))
-            news = self._safe_dict(self._safe_call(self.news.score, symbol))
-            fund = self._safe_dict(self._safe_call(self.fundamental.score, symbol))
+            # --- analyzers ---
+            sm = self._clean_dict(self._safe_call(self.smart_money.score, symbol, fii_dii))
+            vol = self._clean_dict(self._safe_call(self.volume.score, symbol, df, delivery_df))
+            tech = self._clean_dict(self._safe_call(self.tech.score, symbol, df))
+            news = self._clean_dict(self._safe_call(self.news.score, symbol))
+            fund = self._clean_dict(self._safe_call(self.fundamental.score, symbol))
 
-            # --- BUILD RESULT ---
+            # --- result ---
             result = self.scorer.build_result(
                 symbol=symbol,
                 ltp=ltp,
@@ -161,7 +186,7 @@ class IndiaStockScreener:
             score = result.get("composite_score", 0)
             setup = result.get("setup_type", "")
 
-            # --- FILTER ---
+            # --- filters ---
             if mode == "btst" and setup not in ["BTST", "INTRADAY"]:
                 return None
 
@@ -180,7 +205,7 @@ class IndiaStockScreener:
     # RUN
     # ------------------------------------------------ #
 
-    def run(self, mode="all", max_workers=2):  # 🔥 reduced threads (fix DB lock)
+    def run(self, mode="all", max_workers=2):
 
         logger.info(f"Starting screener: {mode}")
         start = time.time()
@@ -190,8 +215,8 @@ class IndiaStockScreener:
         symbols = self.fetcher.get_universe()
 
         if not symbols:
-            logger.error("No symbols fetched")
-            return pd.DataFrame()
+            logger.warning("Universe fetch failed, using fallback list")
+            symbols = ["RELIANCE", "TCS", "INFY", "HDFCBANK"]
 
         results = []
 
