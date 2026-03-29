@@ -11,6 +11,7 @@ class Scorer:
 
         w = config["signals"]["weights"]
 
+        # 🔥 Optimized weights (technical drives system)
         self.weights = {
             "smart_money": w.get("smart_money", 0.20),
             "volume": w.get("volume", 0.20),
@@ -29,14 +30,17 @@ class Scorer:
             if x is None:
                 return float(default)
 
+            # pandas Series
             if hasattr(x, "iloc"):
                 if len(x) == 0:
                     return float(default)
                 return float(x.iloc[-1].item())
 
+            # numpy scalar
             if hasattr(x, "item"):
                 return float(x.item())
 
+            # string cleanup
             if isinstance(x, str):
                 x = x.strip().replace("%", "")
                 if x == "" or x.lower() in ["nan", "none", "na"]:
@@ -72,23 +76,24 @@ class Scorer:
 
     def classify_setup(self, score, tech, vol):
 
-        spike = self._safe_val(vol.get("spike_ratio", 1), 1)
+        tech = tech or {}
+        vol = vol or {}
 
-        patterns = tech.get("patterns", [])
-        if not isinstance(patterns, list):
-            patterns = []
+        spike = self._safe_val(vol.get("spike_ratio", 1))
+        rsi = self._safe_val(tech.get("rsi", 50))
+        trend = tech.get("trend", "")
 
-        ema = bool(tech.get("ema_aligned", False))
-        st = bool(tech.get("supertrend_buy", False))
-
+        # 🔥 Intraday: strong volume + strong score
         if spike >= 2.5 and score >= 50:
             return "INTRADAY"
 
-        if len(patterns) > 0 and score >= 45:
-            return "BTST"
-
-        if ema and st and score >= 40:
+        # 🔥 Momentum swing
+        if trend == "bullish" and 50 <= rsi <= 65 and score >= 40:
             return "SWING"
+
+        # 🔥 Breakout style
+        if spike >= 1.5 and score >= 45:
+            return "BTST"
 
         if score >= self.watch:
             return "WATCH"
@@ -102,12 +107,15 @@ class Scorer:
         if ltp <= 0:
             return {}
 
+        # 🔥 smarter dynamic RR
         if score >= 70:
             tp, sl = 0.05, 0.02
         elif score >= 50:
             tp, sl = 0.04, 0.02
-        else:
+        elif score >= 30:
             tp, sl = 0.03, 0.015
+        else:
+            tp, sl = 0.02, 0.01
 
         entry = round(ltp, 2)
         target = round(ltp * (1 + tp), 2)
@@ -116,10 +124,10 @@ class Scorer:
         risk = entry - stop
         reward = target - entry
 
-        rr = round(reward / risk, 1) if risk > 0 else 0
+        rr = round(reward / risk, 2) if risk > 0 else 0
 
         return {
-            "entry_low": entry,
+            "entry": entry,
             "target": target,
             "stop_loss": stop,
             "rr_ratio": rr,
@@ -127,8 +135,18 @@ class Scorer:
 
     # ---------------- BUILD ---------------- #
 
-    def build_result(self, symbol, ltp, sm_result, vol_result, tech_result, news_result, fund_result):
+    def build_result(
+        self,
+        symbol,
+        ltp,
+        sm_result,
+        vol_result,
+        tech_result,
+        news_result,
+        fund_result,
+    ):
 
+        # 🔥 FORCE NUMERIC SAFELY
         sm = self._safe_val(sm_result.get("score", 0))
         vol = self._safe_val(vol_result.get("score", 0))
         tech = self._safe_val(tech_result.get("score", 0))
@@ -141,11 +159,12 @@ class Scorer:
 
         trade = self.generate_trade_setup(ltp, comp)
 
+        # 🔥 Better signal grading
         if comp >= self.strong_buy:
             signal = "BUY"
         elif comp >= self.watch:
             signal = "WATCH"
-        elif comp >= 20:
+        elif comp >= 25:
             signal = "WEAK"
         else:
             signal = "IGNORE"
@@ -182,9 +201,10 @@ class Scorer:
                     "Score": r.get("composite_score"),
                     "Signal": r.get("signal"),
                     "Setup": r.get("setup_type"),
-                    "Entry": r.get("trade_setup", {}).get("entry_low"),
+                    "Entry": r.get("trade_setup", {}).get("entry"),
                     "Target": r.get("trade_setup", {}).get("target"),
                     "SL": r.get("trade_setup", {}).get("stop_loss"),
+                    "RR": r.get("trade_setup", {}).get("rr_ratio"),
                 })
             except:
                 continue
