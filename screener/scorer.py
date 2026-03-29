@@ -11,7 +11,6 @@ class Scorer:
 
         w = config["signals"]["weights"]
 
-        # 🔥 Optimized weights (technical drives system)
         self.weights = {
             "smart_money": w.get("smart_money", 0.20),
             "volume": w.get("volume", 0.20),
@@ -34,7 +33,8 @@ class Scorer:
             if hasattr(x, "iloc"):
                 if len(x) == 0:
                     return float(default)
-                return float(x.iloc[-1].item())
+                val = x.iloc[-1]
+                return float(val) if not pd.isna(val) else float(default)
 
             # numpy scalar
             if hasattr(x, "item"):
@@ -70,7 +70,8 @@ class Scorer:
             fund * self.weights["fundamental"]
         )
 
-        return int(round(score))
+        # 🔥 SCALE UP (critical for signals)
+        return int(round(score * 2))
 
     # ---------------- CLASSIFY ---------------- #
 
@@ -83,15 +84,12 @@ class Scorer:
         rsi = self._safe_val(tech.get("rsi", 50))
         trend = tech.get("trend", "")
 
-        # 🔥 Intraday: strong volume + strong score
         if spike >= 2.5 and score >= 50:
             return "INTRADAY"
 
-        # 🔥 Momentum swing
         if trend == "bullish" and 50 <= rsi <= 65 and score >= 40:
             return "SWING"
 
-        # 🔥 Breakout style
         if spike >= 1.5 and score >= 45:
             return "BTST"
 
@@ -107,7 +105,6 @@ class Scorer:
         if ltp <= 0:
             return {}
 
-        # 🔥 smarter dynamic RR
         if score >= 70:
             tp, sl = 0.05, 0.02
         elif score >= 50:
@@ -146,7 +143,6 @@ class Scorer:
         fund_result,
     ):
 
-        # 🔥 FORCE NUMERIC SAFELY
         sm = self._safe_val(sm_result.get("score", 0))
         vol = self._safe_val(vol_result.get("score", 0))
         tech = self._safe_val(tech_result.get("score", 0))
@@ -156,10 +152,8 @@ class Scorer:
         comp = self.composite_score(sm, vol, tech, news, fund)
 
         setup = self.classify_setup(comp, tech_result, vol_result)
-
         trade = self.generate_trade_setup(ltp, comp)
 
-        # 🔥 Better signal grading
         if comp >= self.strong_buy:
             signal = "BUY"
         elif comp >= self.watch:
