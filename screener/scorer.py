@@ -26,8 +26,8 @@ class Scorer:
     # ---------------- SAFE VALUE ---------------- #
 
     def _safe_val(self, x, default=0.0):
-    try:
-        # None
+        try:
+            # None
         if x is None:
             return float(default)
 
