@@ -26,23 +26,39 @@ class Scorer:
     # ---------------- SAFE VALUE ---------------- #
 
     def _safe_val(self, x, default=0.0):
-        try:
-            # pandas Series
-            if hasattr(x, "iloc"):
-                return float(x.iloc[-1])
+    try:
+        # None
+        if x is None:
+            return float(default)
 
-            # None or empty
-            if x is None:
-                return default
+        # pandas Series
+        if hasattr(x, "iloc"):
+            if len(x) == 0:
+                return float(default)
+            return float(x.iloc[-1].item())
 
-            # string numbers → convert safely
-            if isinstance(x, str):
-                return float(x)
+        # numpy scalar
+        if hasattr(x, "item"):
+            return float(x.item())
 
+        # string cleanup
+        if isinstance(x, str):
+            x = x.strip().replace("%", "")
+            if x == "" or x.lower() in ["nan", "none", "na"]:
+                return float(default)
             return float(x)
 
-        except:
-            return default
+        # normal number
+        return float(x)
+
+    except Exception:
+        return float(default)
+
+        # normal number
+        return float(x)
+
+    except Exception:
+        return float(default)
 
     # ---------------- SCORE ---------------- #
 
