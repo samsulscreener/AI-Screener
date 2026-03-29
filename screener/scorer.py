@@ -11,11 +11,10 @@ class Scorer:
 
         w = config["signals"]["weights"]
 
-        # 🔥 Slightly improved weights for better signals
         self.weights = {
             "smart_money": w.get("smart_money", 0.20),
             "volume": w.get("volume", 0.20),
-            "technical": w.get("technical", 0.40),  # 🔥 boosted
+            "technical": w.get("technical", 0.40),
             "news": w.get("news", 0.10),
             "fundamental": w.get("fundamental", 0.10),
         }
@@ -27,38 +26,27 @@ class Scorer:
 
     def _safe_val(self, x, default=0.0):
         try:
-            # None
-        if x is None:
-            return float(default)
-
-        # pandas Series
-        if hasattr(x, "iloc"):
-            if len(x) == 0:
+            if x is None:
                 return float(default)
-            return float(x.iloc[-1].item())
 
-        # numpy scalar
-        if hasattr(x, "item"):
-            return float(x.item())
+            if hasattr(x, "iloc"):
+                if len(x) == 0:
+                    return float(default)
+                return float(x.iloc[-1].item())
 
-        # string cleanup
-        if isinstance(x, str):
-            x = x.strip().replace("%", "")
-            if x == "" or x.lower() in ["nan", "none", "na"]:
-                return float(default)
+            if hasattr(x, "item"):
+                return float(x.item())
+
+            if isinstance(x, str):
+                x = x.strip().replace("%", "")
+                if x == "" or x.lower() in ["nan", "none", "na"]:
+                    return float(default)
+                return float(x)
+
             return float(x)
 
-        # normal number
-        return float(x)
-
-    except Exception:
-        return float(default)
-
-        # normal number
-        return float(x)
-
-    except Exception:
-        return float(default)
+        except Exception:
+            return float(default)
 
     # ---------------- SCORE ---------------- #
 
@@ -84,7 +72,7 @@ class Scorer:
 
     def classify_setup(self, score, tech, vol):
 
-        spike = self._safe_val(vol.get("volume_ratio", 1), 1)
+        spike = self._safe_val(vol.get("spike_ratio", 1), 1)
 
         patterns = tech.get("patterns", [])
         if not isinstance(patterns, list):
@@ -114,7 +102,6 @@ class Scorer:
         if ltp <= 0:
             return {}
 
-        # 🔥 dynamic targets
         if score >= 70:
             tp, sl = 0.05, 0.02
         elif score >= 50:
@@ -142,7 +129,6 @@ class Scorer:
 
     def build_result(self, symbol, ltp, sm_result, vol_result, tech_result, news_result, fund_result):
 
-        # 🔥 FORCE NUMERIC (critical fix)
         sm = self._safe_val(sm_result.get("score", 0))
         vol = self._safe_val(vol_result.get("score", 0))
         tech = self._safe_val(tech_result.get("score", 0))
@@ -155,7 +141,6 @@ class Scorer:
 
         trade = self.generate_trade_setup(ltp, comp)
 
-        # 🔥 relaxed signals (important)
         if comp >= self.strong_buy:
             signal = "BUY"
         elif comp >= self.watch:
