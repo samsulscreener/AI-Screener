@@ -16,9 +16,9 @@ class TechnicalAnalyzer:
             close_series = df["Close"]
 
             # ✅ SAFE SCALAR VALUES
-            last_close = float(close_series.iloc[-1])
-            ma20 = float(close_series.rolling(20).mean().iloc[-1])
-            ma50 = float(close_series.rolling(50).mean().iloc[-1])
+            last_close = float(close_series.iloc[-1].item())
+            ma20 = float(close_series.rolling(20).mean().iloc[-1].item())
+            ma50 = float(close_series.rolling(50).mean().iloc[-1].item())
 
             # ---------------- RSI ---------------- #
             delta = close_series.diff()
