@@ -16,9 +16,12 @@ class TechnicalAnalyzer:
             close_series = df["Close"]
 
             # ✅ SAFE SCALAR VALUES
-            last_close = float(close_series.iloc[-1].item())
-            ma20 = float(close_series.rolling(20).mean().iloc[-1].item())
-            ma50 = float(close_series.rolling(50).mean().iloc[-1].item())
+            last_close = float(close_series.iloc[-1]) if not pd.isna(close_series.iloc[-1]) else 0
+            ma20_series = close_series.rolling(20).mean()
+            ma50_series = close_series.rolling(50).mean()
+
+            ma20 = float(ma20_series.iloc[-1]) if not pd.isna(ma20_series.iloc[-1]) else last_close
+            ma50 = float(ma50_series.iloc[-1]) if not pd.isna(ma50_series.iloc[-1]) else last_close
 
             # ---------------- RSI ---------------- #
             delta = close_series.diff()
@@ -32,7 +35,10 @@ class TechnicalAnalyzer:
             rs = avg_gain / (avg_loss + 1e-9)
             rsi = 100 - (100 / (1 + rs))
 
-            rsi_val = float(rsi.iloc[-1].item())
+            rsi_val = rsi.iloc[-1]
+            if pd.isna(rsi_val):
+                rsi_val = 50
+            rsi_val = float(rsi_val)
 
             # ---------------- SCORING ---------------- #
             score = 0
