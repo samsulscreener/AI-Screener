@@ -3,7 +3,8 @@ from loguru import logger
 
 class VolumeAnalyzer:
 
-    def __init__(self, config=None):
+    def __init__(self, session=None, config=None):
+        self.session = session
         self.config = config or {}
 
     def score(self, symbol, df):
