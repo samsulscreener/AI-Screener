@@ -114,15 +114,20 @@ class MarketNewsFetcher:
 
         result = self._compute_weighted_sentiment(articles)
 
-        # 🔥 CRITICAL FIX: add article_count + safe fields
+        # 🔥 FINAL FIX (ALL REQUIRED KEYS)
         return {
             "articles": articles,
             "article_count": len(articles),
 
-            # 🔥 CRITICAL FIX
+            # required by research_engine
             "avg_sentiment": float(result.get("score", 0)),
 
-            # keep your fields
+            # 🔥 THIS WAS YOUR LAST MISSING KEY
+            "top_headlines": [
+                a.get("title") for a in articles if a.get("title")
+            ],
+
+            # keep your original structure
             "score": float(result.get("score", 0)),
             "sentiment": result.get("sentiment", "neutral"),
             "confidence": float(result.get("confidence", 0)),
