@@ -112,7 +112,7 @@ def main():
                     screener_results_raw.append({
                         "symbol": row.get("Symbol"),
                         "ltp": (
-                            row.get("LTP")
+                            row.get("LTP"),
                             or row.get("Close")
                             or row.get("close")
                             or 0
