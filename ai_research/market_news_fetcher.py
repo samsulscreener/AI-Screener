@@ -374,7 +374,10 @@ class MarketNewsFetcher:
 
         # Weighted avg sentiment (weight by relevance)
         if unique_articles:
-            total_weight = sum(a.get("relevance", 0.5) for a in unique_articles)
+            total_weight = sum(
+              float(a.get("relevance", 0.5) or 0.5)
+              for a in unique_articles
+            )
             weighted_sentiment = sum(
                 a.get("sentiment", 0) * a.get("relevance", 0.5)
                 for a in unique_articles
