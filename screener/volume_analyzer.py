@@ -1,4 +1,5 @@
 from loguru import logger
+import pandas as pd
 
 
 class VolumeAnalyzer:
@@ -7,16 +8,21 @@ class VolumeAnalyzer:
         self.session = session
         self.config = config or {}
 
+    def _get_series(self, df, col):
+        data = df[col]
+
+        if isinstance(data, pd.DataFrame):
+            data = data.iloc[:, 0]
+
+        return data.dropna()
+
     def score(self, symbol, df, delivery_df=None):
 
         try:
             if df is None or df.empty:
                 return {"score": 0}
 
-            if "Volume" not in df.columns:
-                return {"score": 0}
-
-            vol = df["Volume"].dropna()
+            vol = self._get_series(df, "Volume")
 
             if len(vol) < 20:
                 return {"score": 0}
