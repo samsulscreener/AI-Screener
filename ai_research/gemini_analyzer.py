@@ -230,5 +230,48 @@ class GeminiAnalyzer:
     # FALLBACK REPORT (CRITICAL FIX)
     # -------------------------------------------------- #
 
-    def _fallback_report(self, screener_result, groq_result):
-        return self._fallback(screener_result, groq_result)
+    # -------------------------------------------------- #
+# FALLBACK (CORE) - FIXED
+# -------------------------------------------------- #
+
+def _fallback(self, r, groq):
+
+    try:
+        ltp = r.get("ltp", 0)
+
+        # use screener trade if exists
+        trade = r.get("trade_setup") or {}
+
+        # generate fallback trade if missing
+        if not trade and ltp > 0:
+            trade = {
+                "entry": ltp,
+                "target": round(ltp * 1.03, 2),
+                "stop_loss": round(ltp * 0.97, 2),
+                "rr_ratio": 2,
+            }
+
+        return {
+            "symbol": r.get("symbol"),
+            "final_recommendation": groq.get("quick_verdict", "HOLD"),
+            "conviction_score": groq.get("conviction", 5),
+            "setup_type": r.get("setup_type", "NO_SIGNAL"),
+            "trade_setup": trade,
+            "summary": groq.get("bull_thesis", "Fallback analysis"),
+            "_ltp": ltp,
+            "_layer": "fallback",
+        }
+
+    except Exception as e:
+        logger.error(f"Fallback failed: {e}")
+
+        return {
+            "symbol": r.get("symbol", "?"),
+            "final_recommendation": "HOLD",
+            "conviction_score": 0,
+            "setup_type": "NO_SIGNAL",
+            "trade_setup": {},
+            "summary": str(e),
+            "_ltp": 0,
+            "_layer": "fallback_error",
+        }
