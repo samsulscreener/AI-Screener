@@ -14,6 +14,12 @@ class MarketNewsFetcher:
         try:
             if x is None:
                 return float(default)
+
+            if isinstance(x, str):
+                x = x.strip()
+                if x == "":
+                    return float(default)
+
             return float(x)
         except:
             return float(default)
@@ -32,11 +38,13 @@ class MarketNewsFetcher:
                 "symbols": symbol,
                 "language": "en",
                 "api_token": self.api_key,
+                "limit": 10,
             }
 
             res = requests.get(url, params=params, timeout=10)
 
             if res.status_code != 200:
+                logger.warning(f"{symbol} news API failed: {res.status_code}")
                 return []
 
             data = res.json()
@@ -62,9 +70,9 @@ class MarketNewsFetcher:
 
         if not articles:
             return {
-                "score": 0,
+                "score": 0.0,
                 "sentiment": "neutral",
-                "confidence": 0
+                "confidence": 0.0
             }
 
         total_weight = sum(
@@ -74,13 +82,13 @@ class MarketNewsFetcher:
 
         if total_weight == 0:
             return {
-                "score": 0,
+                "score": 0.0,
                 "sentiment": "neutral",
-                "confidence": 0
+                "confidence": 0.0
             }
 
         weighted_sentiment = sum(
-            self._safe_float(a.get("sentiment", 0), 0) *
+            self._safe_float(a.get("sentiment", 0), 0.0) *
             self._safe_float(a.get("relevance", 0.5), 0.5)
             for a in articles
         ) / total_weight
@@ -106,9 +114,11 @@ class MarketNewsFetcher:
 
         result = self._compute_weighted_sentiment(articles)
 
+        # 🔥 CRITICAL FIX: add article_count + safe fields
         return {
             "articles": articles,
-            "score": result["score"],
-            "sentiment": result["sentiment"],
-            "confidence": result["confidence"]
+            "article_count": len(articles),   # ✅ FIXED (your crash)
+            "score": float(result.get("score", 0)),
+            "sentiment": result.get("sentiment", "neutral"),
+            "confidence": float(result.get("confidence", 0)),
         }
