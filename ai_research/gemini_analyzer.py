@@ -6,7 +6,6 @@ from loguru import logger
 
 try:
     import google.generativeai as genai
-    from google.generativeai.types import HarmCategory, HarmBlockThreshold
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
@@ -41,6 +40,7 @@ class GeminiAnalyzer:
 
     def _init_client(self):
         if not self.api_key or not GEMINI_AVAILABLE:
+            logger.warning("Gemini not available or API key missing")
             return
 
         try:
@@ -56,6 +56,7 @@ class GeminiAnalyzer:
 
         except Exception as e:
             logger.error(f"Gemini init failed: {e}")
+            self.model = None
 
     def is_available(self):
         return self.model is not None
@@ -66,6 +67,7 @@ class GeminiAnalyzer:
 
     def deep_research(self, screener, groq, news, ctx, fund=None):
 
+        # If Gemini not available → fallback
         if not self.is_available():
             return self._fallback(screener, groq)
 
@@ -84,7 +86,13 @@ class GeminiAnalyzer:
 
                 parsed = self._parse_response(raw)
 
-                parsed["_latency"] = round(time.time() - start, 2)
+                parsed.update({
+                    "symbol": screener.get("symbol"),
+                    "setup_type": screener.get("setup_type"),
+                    "_ltp": screener.get("ltp", 0),
+                    "_latency": round(time.time() - start, 2),
+                    "_layer": "gemini",
+                })
 
                 logger.info(
                     f"{screener.get('symbol')} → {parsed['final_recommendation']} "
@@ -100,7 +108,7 @@ class GeminiAnalyzer:
         return self._fallback(screener, groq)
 
     # -------------------------------------------------- #
-    # PARSER (VERY IMPORTANT)
+    # PARSER
     # -------------------------------------------------- #
 
     def _parse_response(self, text):
@@ -111,14 +119,11 @@ class GeminiAnalyzer:
             data = {}
 
         rec = str(data.get("final_recommendation", "")).upper()
-
         if rec not in ["BUY", "SELL", "HOLD"]:
             rec = "HOLD"
 
-        conviction = data.get("conviction_score", 5)
-
         try:
-            conviction = int(conviction)
+            conviction = int(data.get("conviction_score", 5))
         except:
             conviction = 5
 
@@ -130,8 +135,7 @@ class GeminiAnalyzer:
             "entry": data.get("entry"),
             "target": data.get("target"),
             "stop_loss": data.get("stop_loss"),
-            "raw": text[:300],
-            "_layer": "gemini",
+            "summary": text[:300],
         }
 
     # -------------------------------------------------- #
@@ -180,7 +184,7 @@ class GeminiAnalyzer:
             return {"market_mood": "NEUTRAL"}
 
     # -------------------------------------------------- #
-    # FALLBACK
+    # FALLBACK (CORE)
     # -------------------------------------------------- #
 
     def _fallback(self, r, groq):
@@ -191,8 +195,19 @@ class GeminiAnalyzer:
             "symbol": r.get("symbol"),
             "final_recommendation": groq.get("quick_verdict", "HOLD"),
             "conviction_score": groq.get("conviction", 5),
+            "setup_type": r.get("setup_type", "NO_SIGNAL"),
             "entry": ltp,
-            "target": round(ltp * 1.03, 2),
-            "stop_loss": round(ltp * 0.97, 2),
+            "target": round(ltp * 1.03, 2) if ltp else None,
+            "stop_loss": round(ltp * 0.97, 2) if ltp else None,
+            "trade_setup": r.get("trade_setup", {}),
+            "summary": groq.get("bull_thesis", "Fallback analysis"),
+            "_ltp": ltp,
             "_layer": "fallback",
         }
+
+    # -------------------------------------------------- #
+    # FALLBACK REPORT (CRITICAL FIX)
+    # -------------------------------------------------- #
+
+    def _fallback_report(self, screener_result, groq_result):
+        return self._fallback(screener_result, groq_result)
