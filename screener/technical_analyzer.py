@@ -13,18 +13,19 @@ class TechnicalAnalyzer:
             if df is None or df.empty or len(df) < 50:
                 return {"score": 0}
 
-            close_series = df["Close"]
+            close = df["Close"]
 
-            # ✅ SAFE SCALAR VALUES
-            last_close = float(close_series.iloc[-1]) if not pd.isna(close_series.iloc[-1]) else 0
-            ma20_series = close_series.rolling(20).mean()
-            ma50_series = close_series.rolling(50).mean()
+            # ✅ SAFE SCALARS
+            last_close = float(close.iloc[-1])
+
+            ma20_series = close.rolling(20).mean()
+            ma50_series = close.rolling(50).mean()
 
             ma20 = float(ma20_series.iloc[-1]) if not pd.isna(ma20_series.iloc[-1]) else last_close
             ma50 = float(ma50_series.iloc[-1]) if not pd.isna(ma50_series.iloc[-1]) else last_close
 
             # ---------------- RSI ---------------- #
-            delta = close_series.diff()
+            delta = close.diff()
 
             gain = delta.clip(lower=0)
             loss = -delta.clip(upper=0)
@@ -43,21 +44,23 @@ class TechnicalAnalyzer:
             # ---------------- SCORING ---------------- #
             score = 0
 
-            # 🔥 STRONG TREND
+            # 🔥 TREND
             if last_close > ma20:
                 score += 20
 
             if last_close > ma50:
                 score += 20
 
-            # 🔥 RSI STRENGTH
-            if 50 < rsi_val < 65:
+            # 🔥 MOMENTUM (RSI)
+            if 50 <= rsi_val <= 65:
                 score += 20
-
-            elif 65 <= rsi_val < 75:
+            elif 65 < rsi_val <= 75:
                 score += 15
-
             elif rsi_val < 30:
+                score += 10
+
+            # 🔥 BONUS TREND CONFIRMATION
+            if ma20 > ma50:
                 score += 10
 
             return {
