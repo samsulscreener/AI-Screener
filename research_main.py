@@ -111,7 +111,12 @@ def main():
                 for _, row in screener_df.iterrows():
                     screener_results_raw.append({
                         "symbol": row.get("Symbol"),
-                        "ltp": row.get("LTP") or row.get("Close") or 0,
+                        "ltp": (
+                            row.get("LTP")
+                            or row.get("Close")
+                            or row.get("close")
+                            or 0
+                        ),,
                         "composite_score": row.get("Score", 0),
                         "setup_type": row.get("Setup", ""),
                         "technical": {"rsi": row.get("RSI")},
