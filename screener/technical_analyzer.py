@@ -13,18 +13,24 @@ class TechnicalAnalyzer:
             if df is None or df.empty or len(df) < 50:
                 return {"score": 0}
 
-            close = df["Close"]
+            close = df["Close"].dropna()
 
-            # ✅ SAFE SCALARS
+            if len(close) < 50:
+                return {"score": 0}
+
+            # -------- SAFE SCALARS -------- #
             last_close = float(close.iloc[-1])
 
             ma20_series = close.rolling(20).mean()
             ma50_series = close.rolling(50).mean()
 
-            ma20 = float(ma20_series.iloc[-1]) if not pd.isna(ma20_series.iloc[-1]) else last_close
-            ma50 = float(ma50_series.iloc[-1]) if not pd.isna(ma50_series.iloc[-1]) else last_close
+            ma20_val = ma20_series.iloc[-1]
+            ma50_val = ma50_series.iloc[-1]
 
-            # ---------------- RSI ---------------- #
+            ma20 = float(ma20_val) if not pd.isna(ma20_val) else last_close
+            ma50 = float(ma50_val) if not pd.isna(ma50_val) else last_close
+
+            # -------- RSI -------- #
             delta = close.diff()
 
             gain = delta.clip(lower=0)
@@ -34,24 +40,21 @@ class TechnicalAnalyzer:
             avg_loss = loss.rolling(14).mean()
 
             rs = avg_gain / (avg_loss + 1e-9)
-            rsi = 100 - (100 / (1 + rs))
+            rsi_series = 100 - (100 / (1 + rs))
 
-            rsi_val = rsi.iloc[-1]
-            if pd.isna(rsi_val):
-                rsi_val = 50
-            rsi_val = float(rsi_val)
+            rsi_val = rsi_series.iloc[-1]
+            rsi_val = float(rsi_val) if not pd.isna(rsi_val) else 50.0
 
-            # ---------------- SCORING ---------------- #
+            # -------- SCORING -------- #
             score = 0
 
-            # 🔥 TREND
+            # Trend
             if last_close > ma20:
                 score += 20
-
             if last_close > ma50:
                 score += 20
 
-            # 🔥 MOMENTUM (RSI)
+            # Momentum
             if 50 <= rsi_val <= 65:
                 score += 20
             elif 65 < rsi_val <= 75:
@@ -59,7 +62,7 @@ class TechnicalAnalyzer:
             elif rsi_val < 30:
                 score += 10
 
-            # 🔥 BONUS TREND CONFIRMATION
+            # Trend confirmation
             if ma20 > ma50:
                 score += 10
 
