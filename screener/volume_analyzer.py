@@ -7,7 +7,7 @@ class VolumeAnalyzer:
         self.session = session
         self.config = config or {}
 
-    def score(self, symbol, df, delivery_df=None):  # ✅ FIXED SIGNATURE
+    def score(self, symbol, df, delivery_df=None):
 
         try:
             if df is None or df.empty:
@@ -16,21 +16,19 @@ class VolumeAnalyzer:
             if "Volume" not in df.columns:
                 return {"score": 0}
 
-            vol_series = df["Volume"].dropna()
+            vol = df["Volume"].dropna()
 
-            if len(vol_series) < 20:
+            if len(vol) < 20:
                 return {"score": 0}
 
-            # ✅ SAFE SCALAR
-            latest_vol = float(vol_series.iloc[-1].item())
-            avg_vol = float(vol_series.tail(20).mean())
+            latest_vol = float(vol.iloc[-1])
+            avg_vol = float(vol.tail(20).mean())
 
             if avg_vol == 0:
                 return {"score": 0}
 
             ratio = latest_vol / avg_vol
 
-            # 🔥 STRONGER SCORING
             if ratio >= 2.5:
                 score = 30
             elif ratio >= 2.0:
