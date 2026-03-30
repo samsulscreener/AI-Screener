@@ -199,7 +199,28 @@ class GeminiAnalyzer:
             "entry": ltp,
             "target": round(ltp * 1.03, 2) if ltp else None,
             "stop_loss": round(ltp * 0.97, 2) if ltp else None,
-            "trade_setup": r.get("trade_setup", {}),
+            ltp = r.get("ltp", 0)
+
+            trade = r.get("trade_setup") or {}
+
+            if not trade:
+                if ltp > 0:
+                    trade = {
+                        "entry": ltp,
+                        "target": round(ltp * 1.03, 2),
+                        "stop_loss": round(ltp * 0.97, 2),
+                        "rr_ratio": 2,
+                    }
+
+            return {
+                "symbol": r.get("symbol"),
+                "final_recommendation": groq.get("quick_verdict", "HOLD"),
+                "conviction_score": groq.get("conviction", 5),
+                "setup_type": r.get("setup_type", "NO_SIGNAL"),
+                "trade_setup": trade,
+                "summary": groq.get("bull_thesis", "Fallback analysis"),
+                "_ltp": ltp,
+            }
             "summary": groq.get("bull_thesis", "Fallback analysis"),
             "_ltp": ltp,
             "_layer": "fallback",
