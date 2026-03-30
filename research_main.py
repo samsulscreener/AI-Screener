@@ -35,7 +35,7 @@ def print_report(report: dict):
 
     console.print(Panel(
         f"{reco} | Conviction: {conv}/10 | Setup: {report.get('setup_type')}",
-        title=f"{sym} ₹{report.get('_ltp')}",
+        title=f"{sym} ₹{report.get('_')}",
         border_style="cyan",
     ))
 
@@ -116,7 +116,7 @@ def main():
                             or row.get("Close")
                             or row.get("close")
                             or 0
-                        )
+                        ),
                         "composite_score": row.get("Score", 0),
                         "setup_type": row.get("Setup", ""),
                         "technical": {"rsi": row.get("RSI")},
