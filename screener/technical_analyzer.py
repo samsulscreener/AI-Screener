@@ -7,13 +7,23 @@ class TechnicalAnalyzer:
     def __init__(self, config=None):
         self.config = config or {}
 
+    def _get_series(self, df, col):
+        """Ensure we always get a clean Series"""
+        data = df[col]
+
+        # 🔥 FIX: handle multi-column dataframe
+        if isinstance(data, pd.DataFrame):
+            data = data.iloc[:, 0]
+
+        return data.dropna()
+
     def score(self, symbol, df):
 
         try:
-            if df is None or df.empty or len(df) < 50:
+            if df is None or df.empty:
                 return {"score": 0}
 
-            close = df["Close"].dropna()
+            close = self._get_series(df, "Close")
 
             if len(close) < 50:
                 return {"score": 0}
@@ -24,11 +34,8 @@ class TechnicalAnalyzer:
             ma20_series = close.rolling(20).mean()
             ma50_series = close.rolling(50).mean()
 
-            ma20_val = ma20_series.iloc[-1]
-            ma50_val = ma50_series.iloc[-1]
-
-            ma20 = float(ma20_val) if not pd.isna(ma20_val) else last_close
-            ma50 = float(ma50_val) if not pd.isna(ma50_val) else last_close
+            ma20 = float(ma20_series.iloc[-1]) if not pd.isna(ma20_series.iloc[-1]) else last_close
+            ma50 = float(ma50_series.iloc[-1]) if not pd.isna(ma50_series.iloc[-1]) else last_close
 
             # -------- RSI -------- #
             delta = close.diff()
@@ -48,13 +55,12 @@ class TechnicalAnalyzer:
             # -------- SCORING -------- #
             score = 0
 
-            # Trend
             if last_close > ma20:
                 score += 20
+
             if last_close > ma50:
                 score += 20
 
-            # Momentum
             if 50 <= rsi_val <= 65:
                 score += 20
             elif 65 < rsi_val <= 75:
@@ -62,7 +68,6 @@ class TechnicalAnalyzer:
             elif rsi_val < 30:
                 score += 10
 
-            # Trend confirmation
             if ma20 > ma50:
                 score += 10
 
