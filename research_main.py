@@ -116,7 +116,7 @@ def main():
                             or row.get("Close")
                             or row.get("close")
                             or 0
-                        ),,
+                        )
                         "composite_score": row.get("Score", 0),
                         "setup_type": row.get("Setup", ""),
                         "technical": {"rsi": row.get("RSI")},
