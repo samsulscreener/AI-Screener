@@ -117,7 +117,12 @@ class MarketNewsFetcher:
         # 🔥 CRITICAL FIX: add article_count + safe fields
         return {
             "articles": articles,
-            "article_count": len(articles),   # ✅ FIXED (your crash)
+            "article_count": len(articles),
+
+            # 🔥 CRITICAL FIX
+            "avg_sentiment": float(result.get("score", 0)),
+
+            # keep your fields
             "score": float(result.get("score", 0)),
             "sentiment": result.get("sentiment", "neutral"),
             "confidence": float(result.get("confidence", 0)),
