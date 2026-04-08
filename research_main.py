@@ -63,7 +63,6 @@ def main():
     parser.add_argument("--briefing-only", action="store_true")
     parser.add_argument("--force-deep", action="store_true")
 
-    # 🔥 FIXED: dynamic + correct threshold
     parser.add_argument(
         "--min-score",
         default=int(os.getenv("MIN_SCORE", 35)),
@@ -93,7 +92,6 @@ def main():
 
         reports = []
 
-        # 🚀 RUN SCREENER
         screener_results_raw = []
         screener_df = None
 
@@ -112,7 +110,7 @@ def main():
                     screener_results_raw.append({
                         "symbol": row.get("Symbol"),
                         "ltp": (
-                            row.get("LTP"),
+                            row.get("LTP")
                             or row.get("Close")
                             or row.get("close")
                             or 0
@@ -129,7 +127,6 @@ def main():
                         }
                     })
 
-        # 🚀 FILTER + RESEARCH
         if screener_results_raw:
 
             console.print(f"[yellow]Filtering min score: {args.min_score}[/yellow]")
@@ -152,13 +149,11 @@ def main():
                 reports.append(report)
                 print_report(report)
 
-        # SAVE
         if args.save_json and reports:
             os.makedirs("data", exist_ok=True)
             with open("data/reports.json", "w") as f:
                 json.dump(reports, f, indent=2)
 
-        # ALERT
         if not args.no_alert and reports:
             alerter.send_telegram_reports(reports)
 
