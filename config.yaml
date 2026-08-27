@@ -1,33 +1,41 @@
 # ============================================================
-#  India Smart Stock Screener — Configuration
+#  India Smart Stock Screener — Configuration  (v2, calibrated)
+# ============================================================
+#  NOTE: every key in this file is now actually READ by the code.
+#  If you add a key here, wire it up or delete it.
 # ============================================================
 
 screening:
   mode: all                     # intraday | btst | swing | all
-  universe: nifty500            # nifty50 | nifty200 | nifty500 | custom
+  universe: nifty500            # nifty50 | nifty200 | nifty500 | smallcap250 | custom
   custom_symbols: []            # Used only when universe: custom
+  universe_cache_days: 7        # Re-download the constituent CSV after N days
+
+  # --- Liquidity / price filters (APPLIED in screener.py::_passes_filters) ---
   min_price: 20
   max_price: 15000
-  min_volume: 300000            # Minimum daily traded volume (shares)
-  min_market_cap_cr: 200        # Minimum market cap in crores
-  exclude_sectors: []           # e.g. ["PSU Bank", "Textile"]
+  min_volume: 300000            # Min 20-day avg traded volume (shares)
+  min_turnover_cr: 1.0          # Min 20-day avg turnover in Rs Cr (better than volume)
+  exclude_symbols: []           # Hard blacklist
 
 signals:
+  # Weights are renormalised over whichever components actually returned data,
+  # so a missing component no longer silently drags the score to zero.
   weights:
-    smart_money: 0.25
+    smart_money: 0.20
     volume:      0.20
-    technical:   0.25
-    news:        0.15
-    fundamental: 0.15
+    technical:   0.35
+    news:        0.05
+    fundamental: 0.20
 
   volume:
-    spike_multiplier: 2.5       # Volume > 2.5x 20-day avg = spike
+    spike_multiplier: 2.5       # Relative volume at/above this = full marks
     delivery_pct_min: 55        # Min delivery % to score
-    oi_buildup_pct: 15          # % OI increase to flag
+    adjust_partial_bar: true    # Scale today's volume by elapsed session fraction
 
   technical:
     rsi_period: 14
-    rsi_buy_zone: [35, 60]      # RSI in this range = bullish
+    rsi_buy_zone: [40, 65]      # RSI in this range scores full marks
     rsi_oversold: 30
     rsi_overbought: 75
     macd_fast: 12
@@ -35,42 +43,63 @@ signals:
     macd_signal: 9
     supertrend_period: 10
     supertrend_multiplier: 3.0
-    ema_periods: [9, 21, 50, 200]
-    bb_period: 20
-    bb_std: 2
+    ema_periods: [21, 50, 200]
+    atr_period: 14
+    breakout_lookback: 20       # Bars used for the "near N-day high" component
 
   smart_money:
-    fii_net_buy_threshold_cr: 100    # FII net buy > 100 Cr = positive
-    bulk_deal_min_value_cr: 10       # Min bulk deal value in crores
-    insider_window_days: 30          # Scan insider trades in last N days
+    bulk_deal_min_value_cr: 5        # Min NET bulk/block value in Cr to score
+    insider_window_days: 90
+    # NOTE: FII/DII daily net is MARKET-WIDE. It is no longer part of the
+    # per-stock score — it feeds the regime gate below instead.
 
   news:
-    lookback_hours: 24
-    positive_threshold: 0.25
-    negative_threshold: -0.25
-    sources:
-      - reuters
-      - bloomberg
-      - economic_times
-      - moneycontrol
-      - business_standard
-      - livemint
+    enabled: true               # false => component is dropped and weights renormalise
+    lookback_hours: 48
+    max_articles: 12
+    positive_threshold: 0.15
+    negative_threshold: -0.15
 
   fundamental:
-    min_roe: 12                  # Min ROE %
+    enabled: true
+    cache_days: 7               # Screener.in / NSE fundamentals cache TTL
+    min_roe: 12
+    min_roce: 15
     max_pe: 60
+    min_pe: 3                   # Below this is usually a data error or a value trap
     max_debt_equity: 2.0
-    earnings_surprise_pct: 5     # EPS beat by >5% = positive
+    max_pledge_pct: 10          # Above this = HARD REJECT, not a deduction
+    earnings_surprise_pct: 5
+
+  options:
+    enabled: false              # Turn on once you have a stable NSE connection
+    only_fno_symbols: true
+
+# ------------------------------------------------------------
+#  Market regime gate
+#  Market-wide facts (FII flow, VIX, index trend) do NOT go into the
+#  cross-sectional stock score — they raise or lower the bar instead.
+# ------------------------------------------------------------
+regime:
+  enabled: true
+  vix_caution: 20               # India VIX above this = risk-off
+  vix_calm: 14
+  index_symbol: "^NSEI"
+  threshold_penalty_risk_off: 10   # Add N points to thresholds in a bad tape
+  threshold_bonus_risk_on: 0       # Subtract N points in a good tape (keep 0 to be safe)
 
 scoring:
-  strong_buy_threshold: 70
+  strong_buy_threshold: 70      # Now a REAL 0-100 scale (the x2 fudge is gone)
   watch_threshold: 55
+  weak_threshold: 40
+  cross_sectional_ranks: true   # Also emit a percentile rank within the day's universe
+  min_components: 2             # Need at least N live components to emit a signal
 
 alerts:
   telegram:
     enabled: true
     min_score: 70
-    include_chart: true
+    max_detailed: 5
   email:
     enabled: false
     min_score: 75
@@ -81,12 +110,14 @@ output:
   save_to_db: true
   csv_dir: data/results
   db_path: data/screener.db
+  log_all_candidates: true      # Persist EVERY scored symbol, not just passers.
+                                # This is your backtest dataset — do not turn it off.
 
 schedule:
   timezone: Asia/Kolkata
   intraday:
     enabled: true
-    times: ["09:20", "10:00", "11:00", "12:30", "13:30", "14:30", "15:00"]
+    times: ["09:45", "10:30", "11:30", "13:00", "14:00", "14:45"]
     days: [Mon, Tue, Wed, Thu, Fri]
   btst:
     enabled: true
@@ -98,7 +129,7 @@ schedule:
     days: [Fri]
 
 logging:
-  level: INFO                   # DEBUG | INFO | WARNING | ERROR
+  level: INFO
   log_dir: logs
   rotate: "1 day"
   retention: "30 days"
