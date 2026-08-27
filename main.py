@@ -1,18 +1,30 @@
 #!/usr/bin/env python3
 """
-main.py
--------
-CLI entry point for India Smart Stock Screener.
+main.py  (v2)
+-------------
+FIXES vs v1:
+  * Telegram alerts are ACTUALLY SENT. v1 constructed an AlertManager, printed
+    "Sending Telegram alerts...", and never called send_telegram — and if it
+    had, it would have crashed on missing keys.
+  * The results table prints columns that Scorer.to_dataframe actually emits.
+    v1 asked for LTP / RSI / Vol_Spike / Delivery% which were never produced,
+    so every one of those columns rendered as an em-dash.
+  * Summary counts match the real signal vocabulary (v1 looked for the string
+    "STRONG", which the scorer never emits).
+  * Non-zero exit only on real failure, so cron/GitHub Actions can distinguish
+    "no setups today" from "the screener broke".
 
 Usage:
-  python main.py --mode intraday
-  python main.py --mode btst
   python main.py --mode swing
-  python main.py --mode all --workers 8
+  python main.py --mode intraday --workers 8
+  python main.py --symbols TATAPOWER IRFC --no-alert
+  python main.py --min-score 60 --top 30
 """
 
 import argparse
 import sys
+import traceback
+
 from loguru import logger
 from rich.console import Console
 from rich.table import Table
@@ -23,111 +35,157 @@ from screener.alerts import AlertManager
 
 console = Console()
 
+SIGNAL_STYLE = {
+    "BUY": ("green", "🟢"),
+    "WATCH": ("yellow", "🟡"),
+    "WATCH_NO_ENTRY": ("yellow", "🟠"),
+    "WEAK": ("white", "⚪"),
+    "IGNORE": ("dim", "·"),
+    "REJECTED": ("red", "🔴"),
+    "INSUFFICIENT_DATA": ("dim", "?"),
+}
+
 
 def print_banner():
-    console.print("""
-[bold green]
-╔══════════════════════════════════════════════════════════╗
-║     🇮🇳  India Smart Stock Screener  v1.0               ║
-║     Intraday | BTST | Swing — Institutional Grade        ║
-╚══════════════════════════════════════════════════════════╝
-[/bold green]""")
+    console.print("[bold green]\n  India Smart Stock Screener  v2  "
+                  "[dim]— calibrated 0-100 scoring[/dim]\n[/bold green]")
 
 
-def print_results_table(df):
-    if df.empty:
-        console.print("[yellow]No setups found.[/yellow]")
+def fmt(v, suffix="", dash="—", nd=2):
+    if v is None or v == "":
+        return dash
+    try:
+        return f"{float(v):.{nd}f}{suffix}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def print_results_table(df, regime, top=20):
+    if df is None or df.empty:
+        console.print("[yellow]No symbols scored.[/yellow]")
         return
 
-    table = Table(
-        title=f"📊 Screener Results — {len(df)} Setups",
-        box=box.ROUNDED,
-        show_header=True,
-        header_style="bold magenta",
+    console.print(
+        f"[dim]Market regime:[/dim] [bold]{regime.get('regime', 'unknown').upper()}[/bold]"
+        f"  [dim]threshold {regime.get('threshold_delta', 0):+d}[/dim]"
+        + (f"  [dim]({'; '.join(regime.get('reasons', []))})[/dim]"
+           if regime.get("reasons") else "")
     )
 
-    table.add_column("Rank", style="dim", width=4)
-    table.add_column("Symbol", style="bold cyan", width=14)
-    table.add_column("LTP ₹", justify="right", width=9)
-    table.add_column("Score", justify="center", width=7)
-    table.add_column("Signal", width=12)
-    table.add_column("Setup", width=10)
-    table.add_column("RSI", justify="right", width=6)
-    table.add_column("Vol×", justify="right", width=6)
-    table.add_column("Del%", justify="right", width=6)
-    table.add_column("Target ₹", justify="right", width=9)
-    table.add_column("SL ₹", justify="right", width=9)
-    table.add_column("R/R", justify="right", width=5)
+    table = Table(title=f"Top {min(top, len(df))} of {len(df)} scored",
+                  box=box.SIMPLE_HEAVY, header_style="bold magenta")
 
-    for i, row in df.head(20).iterrows():
-        score = row.get("Score", 0)
-        score_color = "green" if score >= 70 else "yellow" if score >= 55 else "white"
+    for col, w, just in [
+        ("#", 3, "right"), ("Symbol", 13, "left"), ("LTP", 9, "right"),
+        ("Score", 6, "right"), ("Pct", 5, "right"), ("Signal", 15, "left"),
+        ("Setup", 9, "left"), ("RSI", 5, "right"), ("ATR%", 5, "right"),
+        ("Vol×", 5, "right"), ("Del%", 5, "right"), ("Entry", 9, "right"),
+        ("Target", 9, "right"), ("SL", 9, "right"), ("R/R", 5, "right"),
+        ("Live", 4, "right"),
+    ]:
+        table.add_column(col, width=w, justify=just)
 
-        signal = row.get("Signal", "")
-        signal_emoji = "🔴" if "STRONG" in signal else "🟡" if "WATCH" in signal else "⚪"
+    for i, row in df.head(top).iterrows():
+        sig = row.get("Signal", "")
+        style, icon = SIGNAL_STYLE.get(sig, ("white", " "))
+        score = row.get("Score") or 0
+        sc_col = "bold green" if score >= 70 else "yellow" if score >= 55 else "white"
 
         table.add_row(
             str(i + 1),
             str(row.get("Symbol", "")),
-            f"{row.get('LTP', 0):.2f}",
-            f"[{score_color}]{score}[/{score_color}]",
-            f"{signal_emoji} {signal}",
+            fmt(row.get("LTP")),
+            f"[{sc_col}]{fmt(score, nd=1)}[/{sc_col}]",
+            fmt(row.get("Pctile"), nd=0),
+            f"[{style}]{icon} {sig}[/{style}]",
             str(row.get("Setup", "")),
-            f"{row.get('RSI', 0):.1f}" if row.get("RSI") else "—",
-            f"{row.get('Vol_Spike', 0):.1f}x" if row.get("Vol_Spike") else "—",
-            f"{row.get('Delivery%', 0):.0f}%" if row.get("Delivery%") else "—",
-            f"{row.get('Target', 0):.2f}" if row.get("Target") else "—",
-            f"{row.get('SL', 0):.2f}" if row.get("SL") else "—",
-            f"{row.get('RR', 0):.1f}" if row.get("RR") else "—",
+            fmt(row.get("RSI"), nd=0),
+            fmt(row.get("ATR%"), nd=1),
+            fmt(row.get("Vol_Spike"), nd=1),
+            fmt(row.get("Delivery%"), nd=0),
+            fmt(row.get("Entry")),
+            fmt(row.get("Target")),
+            fmt(row.get("SL")),
+            fmt(row.get("RR"), nd=1),
+            str(row.get("Live", "")),
         )
 
     console.print(table)
-    console.print(f"\n[dim]Full results saved to data/results/[/dim]")
+
+
+def print_summary(df):
+    if df is None or df.empty:
+        return
+    console.print("\n[bold]Summary[/bold]")
+    counts = df["Signal"].value_counts().to_dict()
+    for sig in ("BUY", "WATCH", "WATCH_NO_ENTRY", "WEAK", "IGNORE",
+                "REJECTED", "INSUFFICIENT_DATA"):
+        if counts.get(sig):
+            style, icon = SIGNAL_STYLE.get(sig, ("white", " "))
+            console.print(f"  [{style}]{icon} {sig:<20}[/{style}] {counts[sig]}")
+
+    setups = df[df["Signal"].isin(["BUY", "WATCH"])]["Setup"].value_counts().to_dict()
+    if setups:
+        console.print("  [dim]actionable by setup:[/dim] "
+                      + ", ".join(f"{k} {v}" for k, v in setups.items()))
+
+    low = int((df["Live"] < 3).sum()) if "Live" in df.columns else 0
+    if low:
+        console.print(f"  [dim]{low} symbol(s) scored on fewer than 3 live components — "
+                      f"check your NSE connectivity before trusting those.[/dim]")
 
 
 def main():
     print_banner()
 
-    parser = argparse.ArgumentParser(description="India Smart Stock Screener")
-    parser.add_argument("--mode",    default="all",       choices=["intraday", "btst", "swing", "all"])
-    parser.add_argument("--config",  default="config.yaml")
-    parser.add_argument("--workers", default=5, type=int, help="Parallel threads")
-    parser.add_argument("--no-alert", action="store_true", help="Skip Telegram alerts")
-    parser.add_argument("--symbols", nargs="+", help="Override universe with specific symbols")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="India Smart Stock Screener")
+    p.add_argument("--mode", default="all", choices=["intraday", "btst", "swing", "all"])
+    p.add_argument("--config", default="config.yaml")
+    p.add_argument("--workers", default=6, type=int)
+    p.add_argument("--no-alert", action="store_true", help="Skip Telegram alerts")
+    p.add_argument("--symbols", nargs="+", help="Override universe")
+    p.add_argument("--universe", help="Override configured universe")
+    p.add_argument("--min-score", type=float, help="Display filter only (nothing is dropped from the DB)")
+    p.add_argument("--top", type=int, default=20, help="Rows to print")
+    args = p.parse_args()
 
     try:
-        screener = IndiaStockScreener(config_path=args.config)
+        s = IndiaStockScreener(config_path=args.config)
 
-        # Override universe if symbols provided
         if args.symbols:
-            screener.config["screening"]["universe"] = "custom"
-            screener.config["screening"]["custom_symbols"] = args.symbols
+            s.config["screening"]["universe"] = "custom"
+            s.config["screening"]["custom_symbols"] = args.symbols
+        elif args.universe:
+            s.config["screening"]["universe"] = args.universe
 
-        df = screener.run(mode=args.mode, max_workers=args.workers)
-        print_results_table(df)
-
-        # Alerts
-        if not args.no_alert and not df.empty:
-            alert_mgr = AlertManager(screener.config)
-            # Convert df back to result list for alert formatting
-            # (simplified: re-run if you need full dict — or cache raw results)
-            console.print("\n[cyan]📬 Sending Telegram alerts...[/cyan]")
+        df = s.run(mode=args.mode, max_workers=args.workers)
 
         if df.empty:
+            console.print("[yellow]No symbols scored — check the log for data-fetch "
+                          "failures before assuming the market is quiet.[/yellow]")
             sys.exit(0)
 
-        # Print quick summary stats
-        console.print(f"\n[bold]Summary:[/bold]")
-        console.print(f"  Strong Buys: {len(df[df['Signal'].str.contains('STRONG', na=False)])}")
-        console.print(f"  Intraday:    {len(df[df['Setup'] == 'INTRADAY'])}")
-        console.print(f"  BTST:        {len(df[df['Setup'] == 'BTST'])}")
-        console.print(f"  Swing:       {len(df[df['Setup'] == 'SWING'])}")
+        display = df
+        if args.min_score is not None:
+            display = df[df["Score"] >= args.min_score]
+
+        print_results_table(display, s.regime, top=args.top)
+        print_summary(df)
+
+        console.print(f"\n[dim]Run {s.run_id} — "
+                      f"{len(s.last_results)} rows written to the signals table.[/dim]")
+
+        # ---- alerts: actually sent now ----
+        if not args.no_alert:
+            sent = AlertManager(s.config).send_telegram(s.last_results, regime=s.regime)
+            if sent:
+                console.print(f"[cyan]{sent} Telegram alert(s) sent.[/cyan]")
 
     except KeyboardInterrupt:
-        console.print("\n[yellow]Interrupted by user.[/yellow]")
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        sys.exit(130)
     except Exception as e:
-        logger.error(f"Screener error: {e}")
+        logger.error(f"Screener error: {e}\n{traceback.format_exc()}")
         console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
 
