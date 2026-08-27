@@ -1,344 +1,414 @@
 """
-smart_money.py  (v2)
---------------------
+fundamental_analyzer.py  (v2)
+-----------------------------
 FIXES vs v1:
-  * THE BIG ONE: FII/DII daily net flow is MARKET-WIDE. In v1 it contributed
-    12 of a possible 22 points — over half the smart-money score — identically
-    to every stock in the universe on a given day. That is zero ranking
-    information and it floored every stock at ~27 composite on an FII-positive
-    day. It now feeds get_market_regime() instead, which adjusts THRESHOLDS.
-  * Score is a genuine 0-100 built only from STOCK-SPECIFIC evidence.
-  * Cache bug fixed: v1 returned an empty DataFrame on line 86 BEFORE
-    assigning self._bulk_cache, so a failing NSE endpoint was re-hit once
-    per symbol for the entire run (500 wasted requests).
-  * Adds quarter-on-quarter FII/DII *holding change for this stock*, which
-    is genuinely stock-specific, unlike the daily market flow.
-  * available=False when no smart-money data could be fetched, so the
-    scorer renormalises instead of scoring a fake 0.
+  * SQLite cache with a TTL. v1 scraped Screener.in once per symbol per run:
+    7 runs/day x 500 symbols = 3,500 requests/day to a site whose data changes
+    once a quarter. You get rate-limited, the scrape returns {}, and 15-20% of
+    your weighting budget silently zeroes out. Same for the two NSE endpoints.
+  * Score is a genuine 0-100 with an explicit point budget, and components
+    with missing data are dropped and renormalised rather than scored 0.
+  * HARD REJECT on promoter pledge. In Indian smallcaps a pledged promoter
+    holding is the most reliable predictor of permanent capital loss. It must
+    remove the stock from the universe, not deduct a few points.
+  * Growth (sales/profit CAGR) is now scored — v1 had no growth term at all,
+    which is the single most important fundamental input for anything beyond
+    a 2-week horizon.
+  * Polite rate limiting so you don't get your IP banned.
 """
 
+import os
+import re
+import json
+import time
+import sqlite3
+import threading
 import requests
 import pandas as pd
 from loguru import logger
 from datetime import datetime, timedelta
-import pytz
-
-IST = pytz.timezone("Asia/Kolkata")
 
 NSE_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.nseindia.com/",
 }
+SCREENER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml",
+}
 
-_SENTINEL = object()
+_throttle_lock = threading.Lock()
+_last_call = [0.0]
+MIN_INTERVAL = 0.7          # seconds between Screener.in requests, globally
 
 
-class SmartMoneyAnalyzer:
+def _throttle():
+    with _throttle_lock:
+        wait = MIN_INTERVAL - (time.time() - _last_call[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[0] = time.time()
+
+
+class FundamentalAnalyzer:
 
     def __init__(self, session: requests.Session, config: dict):
         self.session = session
-        self.cfg = config.get("signals", {}).get("smart_money", {})
-        self.regime_cfg = config.get("regime", {})
-
-        # caches — note every path assigns before returning
-        self._bulk_cache  = _SENTINEL
-        self._block_cache = _SENTINEL
-        self._fii_cache   = _SENTINEL
-        self._holding_cache = {}
+        self.cfg = config.get("signals", {}).get("fundamental", {})
+        self.enabled = bool(self.cfg.get("enabled", True))
+        self.cache_days = int(self.cfg.get("cache_days", 7))
+        self.db_path = config.get("output", {}).get("db_path", "data/screener.db")
+        self.av_key = os.getenv("ALPHA_VANTAGE_KEY", "")
+        self._init_cache()
 
     # ------------------------------------------------------------------ #
+    #  Cache
+    # ------------------------------------------------------------------ #
 
-    def _safe_json(self, url):
+    def _init_cache(self):
+        d = os.path.dirname(self.db_path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fundamentals_cache (
+                symbol      TEXT PRIMARY KEY,
+                payload     TEXT,
+                fetched_at  TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def _cache_get(self, symbol):
         try:
-            r = self.session.get(url, headers=NSE_HEADERS, timeout=10)
-            if r.status_code != 200:
-                logger.debug(f"NSE {r.status_code} for {url}")
+            conn = sqlite3.connect(self.db_path, timeout=10)
+            row = conn.execute(
+                "SELECT payload, fetched_at FROM fundamentals_cache WHERE symbol=?",
+                (symbol,)).fetchone()
+            conn.close()
+            if not row:
                 return None
-            return r.json()
-        except Exception as e:
-            logger.debug(f"NSE request failed {url}: {e}")
+            fetched = datetime.fromisoformat(row[1])
+            if datetime.now() - fetched > timedelta(days=self.cache_days):
+                return None
+            return json.loads(row[0])
+        except Exception:
             return None
 
-    @staticmethod
-    def _num(x, default=0.0):
+    def _cache_put(self, symbol, payload):
         try:
-            return float(str(x).replace(",", "").replace("%", "").strip() or default)
-        except Exception:
-            return float(default)
+            conn = sqlite3.connect(self.db_path, timeout=10)
+            conn.execute(
+                "INSERT OR REPLACE INTO fundamentals_cache VALUES (?,?,?)",
+                (symbol, json.dumps(payload), datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.debug(f"fundamentals cache write failed for {symbol}: {e}")
 
     # ------------------------------------------------------------------ #
-    #  MARKET-LEVEL  (regime gate, NOT part of the stock score)
+    #  Screener.in
     # ------------------------------------------------------------------ #
 
-    def get_fii_dii_activity(self):
-        if self._fii_cache is not _SENTINEL:
-            return self._fii_cache
+    @staticmethod
+    def _to_num(text):
+        if text is None:
+            return None
+        t = str(text).replace(",", "").replace("%", "").replace("₹", "").strip()
+        m = re.search(r"-?\d+\.?\d*", t)
+        return float(m.group()) if m else None
 
-        data = self._safe_json("https://www.nseindia.com/api/fiidiiTradeReact")
-        result = {"fii_net_cr": 0.0, "dii_net_cr": 0.0, "available": False}
+    def _scrape_screener(self, symbol):
+        """Scrape ratios + growth tables from Screener.in. Returns {} on failure."""
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            logger.warning("beautifulsoup4 not installed; fundamentals unavailable")
+            return {}
 
-        if data:
-            rows = data if isinstance(data, list) else data.get("data", [])
-            fii = dii = 0.0
-            for r in rows[:4]:
-                cat = str(r.get("category", "")).upper()
-                val = self._num(r.get("netPurSales", r.get("netPurchasesSales", 0)))
-                if "FII" in cat or "FPI" in cat:
-                    fii += val
-                elif "DII" in cat:
-                    dii += val
-            result = {"fii_net_cr": fii, "dii_net_cr": dii, "available": True}
-
-        self._fii_cache = result          # cache even on failure
-        return result
-
-    def get_market_regime(self, vix=None, index_above_200dma=None):
-        """
-        Returns a regime dict used to ADJUST THRESHOLDS, never to score a stock.
-
-        risk_on   -> normal or slightly easier bar
-        neutral   -> normal bar
-        risk_off  -> raise the bar; take fewer, better signals
-        """
-        fii = self.get_fii_dii_activity()
-        cfg = self.regime_cfg
-
-        if not cfg.get("enabled", True):
-            return {"regime": "neutral", "threshold_delta": 0, "reasons": ["regime gate disabled"]}
-
-        risk_off_flags, risk_on_flags = [], []
-
-        net_flow = fii.get("fii_net_cr", 0) + fii.get("dii_net_cr", 0)
-        if fii.get("available"):
-            if net_flow < -1500:
-                risk_off_flags.append(f"Institutional net selling Rs {net_flow:,.0f} Cr")
-            elif net_flow > 1500:
-                risk_on_flags.append(f"Institutional net buying Rs {net_flow:,.0f} Cr")
-
-        if vix is not None and vix > 0:
-            if vix > float(cfg.get("vix_caution", 20)):
-                risk_off_flags.append(f"India VIX {vix:.1f} elevated")
-            elif vix < float(cfg.get("vix_calm", 14)):
-                risk_on_flags.append(f"India VIX {vix:.1f} calm")
-
-        if index_above_200dma is False:
-            risk_off_flags.append("Nifty below its 200-DMA")
-        elif index_above_200dma is True:
-            risk_on_flags.append("Nifty above its 200-DMA")
-
-        if len(risk_off_flags) >= 2:
-            regime, delta = "risk_off", int(cfg.get("threshold_penalty_risk_off", 10))
-        elif risk_off_flags:
-            regime, delta = "cautious", int(cfg.get("threshold_penalty_risk_off", 10)) // 2
-        elif len(risk_on_flags) >= 2:
-            regime, delta = "risk_on", -int(cfg.get("threshold_bonus_risk_on", 0))
-        else:
-            regime, delta = "neutral", 0
-
-        return {
-            "regime": regime,
-            "threshold_delta": delta,
-            "fii_net_cr": fii.get("fii_net_cr", 0),
-            "dii_net_cr": fii.get("dii_net_cr", 0),
-            "india_vix": vix,
-            "reasons": risk_off_flags + risk_on_flags,
-        }
-
-    # ------------------------------------------------------------------ #
-    #  STOCK-LEVEL evidence
-    # ------------------------------------------------------------------ #
-
-    def _deals_frame(self, kind):
-        """kind: 'bulk' or 'block'. Cached, including on failure."""
-        attr = f"_{kind}_cache"
-        cached = getattr(self, attr)
-        if cached is not _SENTINEL:
-            return cached
-
-        url = f"https://www.nseindia.com/api/{kind}-deals"
-        data = self._safe_json(url)
-        df = pd.DataFrame()
-
-        if data:
-            df = pd.DataFrame(data.get("data", []))
-            if not df.empty:
-                try:
-                    df["_symbol"] = df.get("symbol", df.get("BD_SYMBOL", pd.Series(dtype=str)))
-                    df["_qty"]    = pd.to_numeric(
-                        df.get("qty", df.get("BD_QTY_TRD", 0)).astype(str).str.replace(",", ""),
-                        errors="coerce").fillna(0)
-                    df["_price"]  = pd.to_numeric(
-                        df.get("watp", df.get("price", df.get("BD_TP_WATP", 0))).astype(str).str.replace(",", ""),
-                        errors="coerce").fillna(0)
-                    df["_side"]   = df.get("buySell", df.get("side", df.get("BD_BUY_SELL", ""))).astype(str)
-                except Exception as e:
-                    logger.debug(f"{kind} deals parse failed: {e}")
-                    df = pd.DataFrame()
-
-        setattr(self, attr, df)       # <-- cache BEFORE returning, always
-        return df
-
-    def get_deals_for_symbol(self, symbol):
-        """Net bulk + block deal value in Rs Cr for this symbol today."""
-        net = 0.0
-        found = False
-        for kind in ("bulk", "block"):
-            df = self._deals_frame(kind)
-            if df.empty or "_symbol" not in df.columns:
-                continue
-            sym_df = df[df["_symbol"].astype(str).str.strip().str.upper() == symbol.upper()]
-            if sym_df.empty:
-                continue
-            found = True
-            for _, r in sym_df.iterrows():
-                val_cr = (r["_qty"] * r["_price"]) / 1e7
-                side = str(r["_side"]).strip().upper()
-                net += val_cr if side.startswith("B") else -val_cr
-        return {"net_cr": round(net, 2), "found": found}
-
-    def get_insider_trades(self, symbol):
-        """Net promoter/insider acquisition over the configured window."""
-        days = int(self.cfg.get("insider_window_days", 90))
-        data = self._safe_json(f"https://www.nseindia.com/api/inside-trading?symbol={symbol}")
-        if not data:
-            return {"available": False, "net_value": 0.0}
-
-        trades = data.get("data", [])
-        if not trades:
-            # No filings is NOT evidence of accumulation. Scoring this as a
-            # neutral 50 would reintroduce exactly the market-wide-constant
-            # problem this module was rewritten to remove.
-            return {"available": False, "net_value": 0.0, "count": 0,
-                    "reason": "no insider filings in window"}
-
-        cutoff = datetime.now() - timedelta(days=days)
-        buy = sell = 0.0
-        count = 0
-        for t in trades[:40]:
+        out = {}
+        for path in ("consolidated/", ""):
+            url = f"https://www.screener.in/company/{symbol}/{path}"
             try:
-                d = pd.to_datetime(t.get("date", t.get("acqfromDt", "")), errors="coerce")
+                _throttle()
+                resp = requests.get(url, timeout=15, headers=SCREENER_HEADERS)
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                ratios = {}
+                for li in soup.select("#top-ratios li"):
+                    name_el = li.select_one(".name")
+                    val_el = li.select_one(".value")
+                    if name_el and val_el:
+                        ratios[name_el.get_text(strip=True)] = val_el.get_text(" ", strip=True)
+
+                if not ratios:
+                    continue
+
+                out = {
+                    "roe":        self._to_num(ratios.get("ROE") or ratios.get("Return on equity")),
+                    "roce":       self._to_num(ratios.get("ROCE") or ratios.get("Return on capital employed")),
+                    "pe":         self._to_num(ratios.get("Stock P/E") or ratios.get("P/E")),
+                    "market_cap": self._to_num(ratios.get("Market Cap")),
+                    "book_value": self._to_num(ratios.get("Book Value")),
+                    "div_yield":  self._to_num(ratios.get("Dividend Yield")),
+                    "face_value": self._to_num(ratios.get("Face Value")),
+                }
+
+                # Debt/equity and pledge live in the ranges/quick-ratio sections
+                page_text = soup.get_text(" ", strip=True)
+                m = re.search(r"Debt to equity\s*([\d.]+)", page_text, re.I)
+                if m:
+                    out["debt_equity"] = float(m.group(1))
+                m = re.search(r"Pledged percentage\s*([\d.]+)", page_text, re.I)
+                out["pledge_pct"] = float(m.group(1)) if m else 0.0
+
+                # Growth tables ("Compounded Sales Growth" / "Compounded Profit Growth")
+                for label, key in (("Compounded Sales Growth", "sales_cagr"),
+                                   ("Compounded Profit Growth", "profit_cagr")):
+                    blk = re.search(
+                        label + r"(.{0,400}?)(?:Compounded|Stock Price|Return on Equity|$)",
+                        page_text, re.I | re.S)
+                    if blk:
+                        nums = re.findall(r"(-?\d+)%", blk.group(1))
+                        if nums:
+                            # order on the page: 10Y, 5Y, 3Y, TTM
+                            out[key + "_5y"] = float(nums[1]) if len(nums) > 1 else float(nums[0])
+                            out[key + "_3y"] = float(nums[2]) if len(nums) > 2 else None
+                            out[key + "_ttm"] = float(nums[3]) if len(nums) > 3 else None
+
+                if out.get("roe") is not None or out.get("pe") is not None:
+                    break
+            except Exception as e:
+                logger.debug(f"Screener.in fetch failed for {symbol} ({path or 'standalone'}): {e}")
+                continue
+
+        return {k: v for k, v in out.items() if v is not None}
+
+    def get_screener_data(self, symbol):
+        cached = self._cache_get(symbol)
+        if cached is not None:
+            return cached
+        data = self._scrape_screener(symbol)
+        self._cache_put(symbol, data)      # cache empties too, so we don't retry all day
+        return data
+
+    # ------------------------------------------------------------------ #
+    #  NSE corporate announcements
+    # ------------------------------------------------------------------ #
+
+    POSITIVE_KW = [
+        "buyback", "buy back", "bonus issue", "merger", "acquisition", "amalgamation",
+        "joint venture", "wins order", "bags order", "order win", "contract",
+        "letter of intent", "expansion", "capacity", "capex", "commissioning",
+        "record date", "interim dividend", "stake acquisition", "fund raise",
+    ]
+    NEGATIVE_KW = [
+        "pledge", "invocation", "downgrade", "default", "insolvency", "nclt",
+        "sebi", "show cause", "investigation", "penalty", "fraud", "litigation",
+        "auditor resignation", "resignation of auditor", "qualified opinion",
+        "resignation of managing director", "resignation of cfo", "delisting",
+    ]
+
+    def get_corporate_announcements(self, symbol, days_back=30):
+        try:
+            resp = self.session.get(
+                f"https://www.nseindia.com/api/top-corp-info?symbol={symbol}&market=equities",
+                headers=NSE_HEADERS, timeout=12)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+        except Exception as e:
+            logger.debug(f"announcements failed for {symbol}: {e}")
+            return None
+
+        cutoff = datetime.now() - timedelta(days=days_back)
+        out = []
+        raw = data.get("announcements", {})
+        items = raw.get("data", raw) if isinstance(raw, dict) else raw
+        for item in (items or []):
+            try:
+                d = pd.to_datetime(item.get("an_dt", item.get("sort_date", "")), errors="coerce")
                 if pd.notna(d) and d.to_pydatetime().replace(tzinfo=None) < cutoff:
                     continue
+                out.append({"date": str(d.date()) if pd.notna(d) else "",
+                            "subject": item.get("subject", "") or item.get("desc", "")})
             except Exception:
-                pass
-            qty = self._num(t.get("secAcq", t.get("acquisitionDisposal", 0)))
-            mode = str(t.get("tdpTransactionType", t.get("acqMode", ""))).lower()
-            count += 1
-            if "acquisition" in mode or "buy" in mode:
-                buy += qty
-            elif "disposal" in mode or "sell" in mode:
-                sell += qty
-        return {"available": True, "net_value": buy - sell, "count": count}
+                continue
+        return out
 
-    def get_holding_change(self, symbol):
+    def _announcement_sentiment(self, announcements):
+        pos = neg = 0
+        flags = []
+        for a in announcements:
+            t = a["subject"].lower()
+            for kw in self.NEGATIVE_KW:
+                if kw in t:
+                    neg += 1
+                    flags.append(a["subject"][:70])
+                    break
+            else:
+                for kw in self.POSITIVE_KW:
+                    if kw in t:
+                        pos += 1
+                        flags.append(a["subject"][:70])
+                        break
+        return pos, neg, flags
+
+    # ------------------------------------------------------------------ #
+    #  Hard rejects
+    # ------------------------------------------------------------------ #
+
+    def hard_reject(self, symbol, ratios=None, announcements=None):
         """
-        Quarter-on-quarter change in FII + DII holding for THIS stock.
-        Unlike daily market flow, this is genuinely stock-specific.
+        Returns (True, reason) if the stock should be removed from the universe
+        entirely. These are not score deductions — the asymmetry justifies it:
+        you have hundreds of candidates, and one fraud costs more than ten misses.
         """
-        if symbol in self._holding_cache:
-            return self._holding_cache[symbol]
+        ratios = ratios if ratios is not None else self.get_screener_data(symbol)
+        max_pledge = float(self.cfg.get("max_pledge_pct", 10))
 
-        data = self._safe_json(
-            f"https://www.nseindia.com/api/shareHoldingPatterns?symbol={symbol}")
-        result = {"available": False}
+        pledge = ratios.get("pledge_pct")
+        if pledge is not None and pledge > max_pledge:
+            return True, f"promoter pledge {pledge:.1f}% > {max_pledge}%"
 
-        if data:
-            records = data.get("data", [])
-            if len(records) >= 2:
-                def inst(rec):
-                    return self._num(rec.get("fiis", 0)) + self._num(rec.get("diis", 0))
-                cur, prev = inst(records[0]), inst(records[1])
-                result = {
-                    "available": True,
-                    "inst_pct": round(cur, 2),
-                    "inst_change_pp": round(cur - prev, 2),
-                    "promoter_pct": self._num(records[0].get("promoter", 0)),
-                }
-            elif len(records) == 1:
-                result = {
-                    "available": True,
-                    "inst_pct": self._num(records[0].get("fiis", 0)) + self._num(records[0].get("diis", 0)),
-                    "inst_change_pp": 0.0,
-                    "promoter_pct": self._num(records[0].get("promoter", 0)),
-                }
+        if announcements:
+            for a in announcements:
+                t = a["subject"].lower()
+                if any(k in t for k in ("auditor resignation", "resignation of auditor",
+                                        "qualified opinion", "insolvency", "nclt admitted")):
+                    return True, f"filing red flag: {a['subject'][:60]}"
 
-        self._holding_cache[symbol] = result
-        return result
+        return False, ""
 
     # ------------------------------------------------------------------ #
-    #  Score  (genuine 0-100, stock-specific only)
+    #  Score  (genuine 0-100)
     # ------------------------------------------------------------------ #
-    #  Bulk/block net buying   45
-    #  Insider net buying      30
-    #  Institutional holding   25
-    #                         ----
-    #                         100
-    #  Components with no data are dropped from BOTH numerator and
-    #  denominator. If nothing is available at all -> available=False.
+    #  Profitability (ROE + ROCE)   30
+    #  Growth (sales + profit CAGR) 25
+    #  Balance sheet (D/E)          15
+    #  Valuation (PE sanity)        10
+    #  Corporate announcements      20
+    #                              ----
+    #                              100
     # ------------------------------------------------------------------ #
 
-    def score(self, symbol, fii_dii=None):
+    def score(self, symbol):
+        if not self.enabled:
+            return {"score": 0.0, "available": False, "reason": "fundamentals disabled"}
+
         pts = 0.0
         budget = 0.0
         details = {}
 
-        # --- 1. Bulk / block deals: 45 pts ---
-        deals = self.get_deals_for_symbol(symbol)
-        min_cr = float(self.cfg.get("bulk_deal_min_value_cr", 5))
-        if deals["found"]:
-            budget += 45
-            net = deals["net_cr"]
-            if net >= min_cr * 3:
-                pts += 45
-            elif net >= min_cr:
-                pts += 32
-            elif net > 0:
-                pts += 15
-            elif net <= -min_cr:
-                pts += 0          # net institutional selling
-            else:
-                pts += 8
-            details["bulk_block_net_cr"] = net
+        ratios = self.get_screener_data(symbol)
+        anns = self.get_corporate_announcements(symbol)
 
-        # --- 2. Insider activity: 30 pts (only when filings actually exist) ---
-        insider = self.get_insider_trades(symbol)
-        if insider.get("available") and insider.get("count", 0) > 0:
+        rejected, reason = self.hard_reject(symbol, ratios, anns)
+        if rejected:
+            return {"score": 0.0, "available": True, "hard_reject": True,
+                    "reject_reason": reason, "ratios": ratios, "details": {}}
+
+        # --- Profitability: 30 ---
+        roe = ratios.get("roe")
+        roce = ratios.get("roce")
+        if roe is not None or roce is not None:
             budget += 30
-            nv = insider.get("net_value", 0.0)
-            if nv > 0:
-                pts += 30
-                details["insider"] = "net buying"
-            elif nv < 0:
-                pts += 0
-                details["insider"] = "net selling"
-            else:
-                pts += 15
-                details["insider"] = "offsetting trades"
+            min_roe = float(self.cfg.get("min_roe", 12))
+            min_roce = float(self.cfg.get("min_roce", 15))
+            if roe is not None:
+                if roe >= min_roe * 1.5:
+                    pts += 15
+                elif roe >= min_roe:
+                    pts += 11
+                elif roe > 0:
+                    pts += 4
+                details["roe"] = roe
+            if roce is not None:
+                if roce >= min_roce * 1.5:
+                    pts += 15
+                elif roce >= min_roce:
+                    pts += 11
+                elif roce > 0:
+                    pts += 4
+                details["roce"] = roce
 
-        # --- 3. Institutional holding change: 25 pts ---
-        hold = self.get_holding_change(symbol)
-        if hold.get("available"):
+        # --- Growth: 25 ---
+        s5 = ratios.get("sales_cagr_5y")
+        p5 = ratios.get("profit_cagr_5y")
+        if s5 is not None or p5 is not None:
             budget += 25
-            chg = hold.get("inst_change_pp", 0.0)
-            if chg >= 1.0:
-                pts += 25
-            elif chg > 0:
-                pts += 18
-            elif chg == 0:
+            if s5 is not None:
+                if s5 >= 20:
+                    pts += 13
+                elif s5 >= 12:
+                    pts += 9
+                elif s5 >= 5:
+                    pts += 4
+                details["sales_cagr_5y"] = s5
+            if p5 is not None:
+                if p5 >= 20:
+                    pts += 12
+                elif p5 >= 12:
+                    pts += 8
+                elif p5 >= 5:
+                    pts += 4
+                details["profit_cagr_5y"] = p5
+
+        # --- Balance sheet: 15 ---
+        de = ratios.get("debt_equity")
+        if de is not None:
+            budget += 15
+            max_de = float(self.cfg.get("max_debt_equity", 2.0))
+            if de <= 0.3:
+                pts += 15
+            elif de <= max_de / 2:
+                pts += 11
+            elif de <= max_de:
+                pts += 6
+            details["debt_equity"] = de
+
+        # --- Valuation sanity: 10 ---
+        pe = ratios.get("pe")
+        if pe is not None:
+            budget += 10
+            min_pe = float(self.cfg.get("min_pe", 3))
+            max_pe = float(self.cfg.get("max_pe", 60))
+            if min_pe <= pe <= max_pe * 0.5:
                 pts += 10
-            details["inst_holding_pct"] = hold.get("inst_pct")
-            details["inst_change_pp"] = chg
+            elif min_pe <= pe <= max_pe:
+                pts += 6
+            details["pe"] = pe
+
+        # --- Announcements: 20 ---
+        if anns is not None:
+            budget += 20
+            pos, neg, flags = self._announcement_sentiment(anns)
+            net = pos - neg
+            if net >= 2:
+                pts += 20
+            elif net == 1:
+                pts += 14
+            elif net == 0:
+                pts += 10
+            elif net == -1:
+                pts += 4
+            details["announcements_net"] = net
+            if flags:
+                details["announcement_sample"] = flags[0]
 
         if budget == 0:
             return {"score": 0.0, "available": False,
-                    "reason": "no stock-specific smart-money data", "details": {}}
+                    "reason": "no fundamental data", "ratios": {}, "details": {}}
 
         return {
             "score": round(pts / budget * 100.0, 1),
             "available": True,
+            "hard_reject": False,
             "components_used": int(budget),
+            "ratios": ratios,
             "details": details,
         }
