@@ -1,77 +1,210 @@
 """
-data_fetcher.py
----------------
-Fetches OHLCV, market breadth, and stock universe data
-from NSE, BSE, and Yahoo Finance.
+data_fetcher.py  (v2)
+---------------------
+FIXES vs v1:
+  * Universe no longer depends on NSE's equity-stockIndices API, which
+    rejects datacentre IPs and most un-warmed sessions. v1 therefore fell
+    through to _fallback_nifty50 — 30 megacaps — silently, and from GitHub
+    Actions it did so essentially always. v2 downloads the official
+    constituent CSV from nsearchives, caches it to disk for N days, and
+    LOGS LOUDLY when the universe is smaller than expected.
+  * MultiIndex columns from yfinance are flattened at the source. This is
+    the root cause of the LTP=0 bug in screener.py:127.
+  * Thread-local requests.Session. v1 shared one Session (and its mutating
+    NSE cookie jar) across every ThreadPoolExecutor worker.
+  * Batch OHLCV via a single yfinance call instead of 500 sequential ones.
+  * Liquidity filters from config are actually computed here.
 """
 
+import os
+import io
 import time
+import threading
+from datetime import datetime, timedelta
+from typing import List, Optional
+
 import requests
 import pandas as pd
 import yfinance as yf
 from loguru import logger
-from typing import List, Optional
-from functools import lru_cache
-from datetime import datetime, timedelta
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
 
 NSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.nseindia.com",
+    "Referer": "https://www.nseindia.com/",
 }
 
-# Pre-defined index constituents (symbols as per Yahoo Finance: SYMBOL.NS)
-UNIVERSES = {
-    "nifty50":  "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050",
-    "nifty200": "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20200",
-    "nifty500": "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500",
+# Official constituent lists. These are static files, not the API, and they
+# are far more reliable from a server.
+UNIVERSE_CSV = {
+    "nifty50":     "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv",
+    "nifty200":    "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv",
+    "nifty500":    "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
+    "smallcap250": "https://nsearchives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
+    "midcap150":   "https://nsearchives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
 }
+EXPECTED_SIZE = {"nifty50": 50, "nifty200": 200, "nifty500": 500,
+                 "smallcap250": 250, "midcap150": 150}
+
+CACHE_DIR = "data/universe"
+
+
+def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse yfinance MultiIndex columns down to plain OHLCV names."""
+    if df is not None and isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        lvl0 = set(df.columns.get_level_values(0))
+        # yfinance orders as (field, ticker) or (ticker, field) depending on version
+        if {"Close", "Open", "High", "Low", "Volume"} & lvl0:
+            df.columns = df.columns.get_level_values(0)
+        else:
+            df.columns = df.columns.get_level_values(-1)
+    return df
 
 
 class DataFetcher:
+
     def __init__(self, config: dict):
-        self.cfg = config["screening"]
-        self.session = requests.Session()
-        self._init_nse_session()
+        self.config = config
+        self.cfg = config.get("screening", {})
+        self._local = threading.local()
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        # warm one session up front so the cookie jar exists
+        self._init_session(self.session)
 
     # ------------------------------------------------------------------ #
-    #  Session & Universe
+    #  Thread-local sessions
     # ------------------------------------------------------------------ #
 
-    def _init_nse_session(self):
-        """NSE requires a cookie handshake before API calls."""
+    @property
+    def session(self) -> requests.Session:
+        """One Session per thread. NSE mutates cookies on every call and a
+        shared Session across a ThreadPoolExecutor is not safe."""
+        s = getattr(self._local, "session", None)
+        if s is None:
+            s = requests.Session()
+            s.headers.update(NSE_HEADERS)
+            self._init_session(s)
+            self._local.session = s
+        return s
+
+    @staticmethod
+    def _init_session(s: requests.Session):
+        """NSE needs a cookie handshake before any API call will answer."""
         try:
-            self.session.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
-            logger.debug("NSE session initialized")
+            s.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
+            s.get("https://www.nseindia.com/market-data/live-equity-market",
+                  headers=NSE_HEADERS, timeout=10)
         except Exception as e:
-            logger.warning(f"NSE session init failed: {e}. Some data may be unavailable.")
+            logger.debug(f"NSE session warm-up failed: {e}")
+
+    # ------------------------------------------------------------------ #
+    #  Universe
+    # ------------------------------------------------------------------ #
 
     def get_universe(self) -> List[str]:
-        """Return list of NSE symbols based on configured universe."""
         universe = self.cfg.get("universe", "nifty500")
         custom = self.cfg.get("custom_symbols", [])
+        exclude = {s.upper() for s in self.cfg.get("exclude_symbols", [])}
 
         if universe == "custom" and custom:
-            logger.info(f"Using custom universe: {len(custom)} symbols")
-            return [s.upper() for s in custom]
+            syms = [s.upper() for s in custom]
+            logger.info(f"Custom universe: {len(syms)} symbols")
+            return [s for s in syms if s not in exclude]
 
-        url = UNIVERSES.get(universe, UNIVERSES["nifty500"])
+        symbols = self._universe_from_csv(universe)
+
+        if not symbols:
+            symbols = self._universe_from_api(universe)
+
+        if not symbols:
+            logger.error(
+                f"UNIVERSE FETCH FAILED for {universe}. Falling back to 30 hardcoded "
+                f"megacaps. Your screen is now covering 6% of the intended universe — "
+                f"treat today's results as unrepresentative."
+            )
+            symbols = self._fallback_nifty50()
+
+        expected = EXPECTED_SIZE.get(universe)
+        if expected and len(symbols) < expected * 0.8:
+            logger.warning(
+                f"Universe {universe} returned {len(symbols)} symbols, expected ~{expected}. "
+                f"Results are not comparable to a full run."
+            )
+
+        symbols = [s for s in symbols if s not in exclude]
+        logger.info(f"Universe {universe}: {len(symbols)} symbols")
+        return symbols
+
+    def _universe_from_csv(self, universe) -> List[str]:
+        url = UNIVERSE_CSV.get(universe)
+        if not url:
+            return []
+
+        cache_path = os.path.join(CACHE_DIR, f"{universe}.csv")
+        ttl_days = int(self.cfg.get("universe_cache_days", 7))
+
+        if os.path.exists(cache_path):
+            age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(cache_path))
+            if age < timedelta(days=ttl_days):
+                try:
+                    df = pd.read_csv(cache_path)
+                    syms = df["Symbol"].dropna().astype(str).str.strip().str.upper().tolist()
+                    if syms:
+                        logger.debug(f"Universe {universe} from cache ({age.days}d old)")
+                        return syms
+                except Exception:
+                    pass
+
         try:
-            resp = self.session.get(url, headers=NSE_HEADERS, timeout=15)
-            data = resp.json()
-            symbols = [item["symbol"] for item in data.get("data", []) if item.get("symbol")]
-            logger.info(f"Fetched {len(symbols)} symbols from {universe.upper()}")
-            return symbols
+            resp = self.session.get(url, headers=NSE_HEADERS, timeout=20)
+            resp.raise_for_status()
+            df = pd.read_csv(io.StringIO(resp.text))
+            syms = df["Symbol"].dropna().astype(str).str.strip().str.upper().tolist()
+            if syms:
+                df.to_csv(cache_path, index=False)
+                logger.info(f"Universe {universe} downloaded: {len(syms)} symbols (cached)")
+                return syms
         except Exception as e:
-            logger.error(f"Failed to fetch universe from NSE: {e}")
-            return self._fallback_nifty50()
+            logger.warning(f"Constituent CSV fetch failed for {universe}: {e}")
 
-    def _fallback_nifty50(self) -> List[str]:
-        """Hardcoded Nifty 50 fallback."""
+        # stale cache beats no cache
+        if os.path.exists(cache_path):
+            try:
+                df = pd.read_csv(cache_path)
+                syms = df["Symbol"].dropna().astype(str).str.strip().str.upper().tolist()
+                logger.warning(f"Using STALE cached universe for {universe} ({len(syms)} symbols)")
+                return syms
+            except Exception:
+                pass
+        return []
+
+    def _universe_from_api(self, universe) -> List[str]:
+        names = {"nifty50": "NIFTY%2050", "nifty200": "NIFTY%20200",
+                 "nifty500": "NIFTY%20500", "smallcap250": "NIFTY%20SMALLCAP%20250",
+                 "midcap150": "NIFTY%20MIDCAP%20150"}
+        idx = names.get(universe)
+        if not idx:
+            return []
+        try:
+            r = self.session.get(
+                f"https://www.nseindia.com/api/equity-stockIndices?index={idx}",
+                headers=NSE_HEADERS, timeout=15)
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            return [i["symbol"].upper() for i in data.get("data", []) if i.get("symbol")]
+        except Exception as e:
+            logger.debug(f"Index API fallback failed: {e}")
+            return []
+
+    @staticmethod
+    def _fallback_nifty50() -> List[str]:
         return [
             "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
             "HINDUNILVR", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK",
@@ -82,102 +215,156 @@ class DataFetcher:
         ]
 
     # ------------------------------------------------------------------ #
-    #  Price & OHLCV Data
+    #  OHLCV
     # ------------------------------------------------------------------ #
 
-    def get_ohlcv(self, symbol: str, period: str = "3mo", interval: str = "1d") -> Optional[pd.DataFrame]:
-        """Fetch OHLCV data via Yahoo Finance."""
-        ticker = f"{symbol}.NS"
+    @staticmethod
+    def to_yahoo(symbol: str) -> str:
+        return f"{symbol.replace('&', '%26') if False else symbol}.NS"
+
+    def get_ohlcv(self, symbol: str, period="1y", interval="1d") -> Optional[pd.DataFrame]:
         try:
-            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-            if df.empty:
-                logger.warning(f"No data for {symbol}")
+            df = yf.download(
+                self.to_yahoo(symbol), period=period, interval=interval,
+                progress=False, auto_adjust=True, threads=False,
+            )
+            if df is None or df.empty:
                 return None
+            df = flatten_columns(df)
             df.index = pd.to_datetime(df.index)
             return df
         except Exception as e:
-            logger.error(f"OHLCV fetch failed for {symbol}: {e}")
+            logger.debug(f"OHLCV failed for {symbol}: {e}")
             return None
 
-    def get_intraday_ohlcv(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Fetch 5-min intraday OHLCV for today."""
-        return self.get_ohlcv(symbol, period="5d", interval="5m")
+    def batch_ohlcv(self, symbols: List[str], period="1y", interval="1d",
+                    chunk=60) -> dict:
+        """
+        One yfinance call per chunk instead of one per symbol.
+        For 500 names this is ~9 requests instead of 500.
+        """
+        out = {}
+        for i in range(0, len(symbols), chunk):
+            batch = symbols[i:i + chunk]
+            tickers = [self.to_yahoo(s) for s in batch]
+            try:
+                raw = yf.download(
+                    tickers, period=period, interval=interval,
+                    progress=False, auto_adjust=True, group_by="ticker",
+                    threads=True,
+                )
+            except Exception as e:
+                logger.warning(f"Batch OHLCV failed for chunk {i//chunk}: {e}")
+                continue
 
-    def get_quote(self, symbol: str) -> dict:
-        """Fetch live NSE quote."""
-        url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
-        try:
-            resp = self.session.get(url, headers=NSE_HEADERS, timeout=10)
-            data = resp.json()
-            pd_data = data.get("priceInfo", {})
-            return {
-                "symbol": symbol,
-                "ltp": pd_data.get("lastPrice", 0),
-                "open": pd_data.get("open", 0),
-                "high": pd_data.get("intraDayHighLow", {}).get("max", 0),
-                "low": pd_data.get("intraDayHighLow", {}).get("min", 0),
-                "prev_close": pd_data.get("previousClose", 0),
-                "change_pct": pd_data.get("pChange", 0),
-                "volume": data.get("securityInfo", {}).get("tradedVolume", 0),
-            }
-        except Exception as e:
-            logger.error(f"Quote fetch failed for {symbol}: {e}")
-            return {}
+            for sym, tkr in zip(batch, tickers):
+                try:
+                    if isinstance(raw.columns, pd.MultiIndex):
+                        if tkr not in raw.columns.get_level_values(0):
+                            continue
+                        sub = raw[tkr].dropna(how="all")
+                    else:
+                        sub = raw.dropna(how="all")
+                    if not sub.empty:
+                        out[sym] = sub
+                except Exception:
+                    continue
+            time.sleep(0.4)
+
+        logger.info(f"OHLCV batch: {len(out)}/{len(symbols)} symbols retrieved")
+        return out
 
     # ------------------------------------------------------------------ #
-    #  Delivery & Market Breadth
+    #  Liquidity filter  (config keys that v1 never read)
     # ------------------------------------------------------------------ #
 
-    def get_bhav_copy(self) -> Optional[pd.DataFrame]:
-        """Download today's NSE Bhavcopy (EOD data with delivery %)."""
-        today = datetime.now(IST)
-        date_str = today.strftime("%d%b%Y").upper()
-        url = f"https://www.nseindia.com/api/reports?archives=%5B%7B%22name%22%3A%22CM%20Bhavcopy%22%2C%22type%22%3A%22daily%22%2C%22category%22%3A%22capital-market%22%2C%22section%22%3A%22equities%22%7D%5D&date={today.strftime('%d-%m-%Y')}&type=equities&mode=single"
+    def passes_filters(self, symbol: str, df: pd.DataFrame):
+        """Returns (ok: bool, reason: str). Applies min/max price, min volume
+        and min turnover from config — none of which v1 ever used."""
         try:
-            resp = self.session.get(url, headers=NSE_HEADERS, timeout=20)
-            df = pd.read_csv(pd.io.common.StringIO(resp.text))
-            logger.info(f"Bhavcopy fetched: {len(df)} rows")
-            return df
+            df = flatten_columns(df)
+            close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+            vol = pd.to_numeric(df["Volume"], errors="coerce").dropna()
+            if close.empty or len(vol) < 20:
+                return False, "insufficient history"
+
+            ltp = float(close.iloc[-1])
+            avg_vol = float(vol.tail(20).mean())
+            turnover_cr = ltp * avg_vol / 1e7
+
+            if ltp < float(self.cfg.get("min_price", 0)):
+                return False, f"price {ltp:.1f} below min"
+            if ltp > float(self.cfg.get("max_price", 1e9)):
+                return False, f"price {ltp:.1f} above max"
+            if avg_vol < float(self.cfg.get("min_volume", 0)):
+                return False, f"avg vol {avg_vol:,.0f} below min"
+            if turnover_cr < float(self.cfg.get("min_turnover_cr", 0)):
+                return False, f"turnover Rs {turnover_cr:.2f}Cr below min"
+            return True, ""
         except Exception as e:
-            logger.warning(f"Bhavcopy fetch failed: {e}")
-            return None
+            return False, f"filter error: {e}"
+
+    # ------------------------------------------------------------------ #
+    #  Market context
+    # ------------------------------------------------------------------ #
 
     def get_delivery_data(self) -> Optional[pd.DataFrame]:
-        """Get delivery position data from NSE."""
-        url = "https://www.nseindia.com/api/deliveryposition"
+        """
+        NSE's securitywise delivery data. Endpoint shape changes often, so
+        this returns None rather than an empty frame on failure — the volume
+        analyzer then renormalises instead of scoring a fake 0.
+        """
+        for url in (
+            "https://www.nseindia.com/api/snapshot-capital-market-ordersbook?type=deliverable",
+            "https://www.nseindia.com/api/deliveryposition",
+        ):
+            try:
+                r = self.session.get(url, headers=NSE_HEADERS, timeout=15)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                rows = data.get("data", data if isinstance(data, list) else [])
+                df = pd.DataFrame(rows)
+                if not df.empty:
+                    logger.info(f"Delivery data: {len(df)} rows")
+                    return df
+            except Exception:
+                continue
+        logger.warning("Delivery data unavailable — volume component will renormalise")
+        return None
+
+    def get_index_context(self) -> dict:
+        """Nifty trend + India VIX, used only by the regime gate."""
+        ctx = {"index_above_200dma": None, "india_vix": None}
         try:
-            resp = self.session.get(url, headers=NSE_HEADERS, timeout=15)
-            data = resp.json()
-            df = pd.DataFrame(data.get("data", []))
-            return df
+            idx = yf.download(self.config.get("regime", {}).get("index_symbol", "^NSEI"),
+                              period="2y", interval="1d", progress=False,
+                              auto_adjust=True, threads=False)
+            idx = flatten_columns(idx)
+            if idx is not None and len(idx) > 200:
+                c = pd.to_numeric(idx["Close"], errors="coerce").dropna()
+                ctx["index_above_200dma"] = bool(c.iloc[-1] > c.rolling(200).mean().iloc[-1])
+                ctx["index_ltp"] = round(float(c.iloc[-1]), 2)
         except Exception as e:
-            logger.warning(f"Delivery data fetch failed: {e}")
-            return None
+            logger.debug(f"Index context failed: {e}")
 
-    # ------------------------------------------------------------------ #
-    #  Batch Fetching with Rate Limiting
-    # ------------------------------------------------------------------ #
+        try:
+            r = self.session.get("https://www.nseindia.com/api/allIndices",
+                                 headers=NSE_HEADERS, timeout=10)
+            if r.status_code == 200:
+                for i in r.json().get("data", []):
+                    if "VIX" in str(i.get("index", "")).upper():
+                        ctx["india_vix"] = float(i.get("last", 0))
+                        break
+        except Exception as e:
+            logger.debug(f"VIX fetch failed: {e}")
 
-    def batch_ohlcv(self, symbols: List[str], period: str = "3mo") -> dict:
-        """Fetch OHLCV for multiple symbols with rate limiting."""
-        results = {}
-        failed = []
-        for i, sym in enumerate(symbols):
-            df = self.get_ohlcv(sym, period=period)
-            if df is not None and not df.empty:
-                results[sym] = df
-            else:
-                failed.append(sym)
-            if i > 0 and i % 20 == 0:
-                time.sleep(1)  # Rate limiting courtesy
-        logger.info(f"OHLCV batch: {len(results)} success, {len(failed)} failed")
-        return results
+        return ctx
 
     def get_market_status(self) -> bool:
-        """Check if NSE market is currently open."""
         now = datetime.now(IST)
         if now.weekday() >= 5:
             return False
-        market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        return market_open <= now <= market_close
+        o = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        c = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        return o <= now <= c
